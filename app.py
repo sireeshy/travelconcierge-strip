@@ -43,6 +43,7 @@ USAGE_LOG_HEADER = [
     "tool_calls", "tool_errors", "structured_ok", "response_type",
     "places_api_new", "places_api_legacy", "places_api_failed",
     "routes_api_new", "routes_api_legacy", "routes_api_failed",
+    "places_cache_fresh", "places_cache_verified", "places_cache_drift",
 ]
 
 
@@ -78,7 +79,11 @@ def log_usage_event(event_type: str, origin: str, destination: str, preferences:
     response_type} dict from response_to_markdown. places_api_stats / routes_api_stats are the
     {'new', 'legacy', 'failed'} counter dicts accumulated in st.session_state['_places_api_stats']
     / ['_routes_api_stats'] by the Places/Routes tool functions this request (empty/None if a tool
-    didn't run, e.g. a follow-up that didn't need a fresh lookup).
+    didn't run, e.g. a follow-up that didn't need a fresh lookup). places_api_stats also carries
+    'cache_fresh'/'cache_verified'/'cache_verify_failed' from get_place_details_and_reviews's
+    place-details cache -- this is what makes the cache's actual payoff (how often a place lookup
+    was free or half-price instead of a full paid call) a real, trackable number instead of an
+    assumed win.
 
     Beyond timing, this is the performance signal for things that can silently degrade without
     anyone noticing in a chat UI: tool_errors catches a Gemini tool call that ultimately failed;
@@ -98,10 +103,14 @@ def log_usage_event(event_type: str, origin: str, destination: str, preferences:
     logger.info(
         "usage event=%s origin=%r destination=%r duration_s=%.2f tool_calls=%d tool_errors=%d "
         "places_api_new=%d places_api_legacy=%d places_api_failed=%d "
-        "routes_api_new=%d routes_api_legacy=%d routes_api_failed=%d structured_ok=%s response_type=%s [%s]",
+        "routes_api_new=%d routes_api_legacy=%d routes_api_failed=%d "
+        "places_cache_fresh=%d places_cache_verified=%d places_cache_drift=%d "
+        "structured_ok=%s response_type=%s [%s]",
         event_type, origin, destination, duration_s, len(tool_trace), tool_errors,
         places_api_stats.get('new', 0), places_api_stats.get('legacy', 0), places_api_stats.get('failed', 0),
         routes_api_stats.get('new', 0), routes_api_stats.get('legacy', 0), routes_api_stats.get('failed', 0),
+        places_api_stats.get('cache_fresh', 0), places_api_stats.get('cache_verified', 0),
+        places_api_stats.get('cache_verify_failed', 0),
         response_meta.get("structured_ok"), response_meta.get("response_type"), tool_summary,
     )
     row = [
@@ -122,6 +131,9 @@ def log_usage_event(event_type: str, origin: str, destination: str, preferences:
         routes_api_stats.get('new', 0),
         routes_api_stats.get('legacy', 0),
         routes_api_stats.get('failed', 0),
+        places_api_stats.get('cache_fresh', 0),
+        places_api_stats.get('cache_verified', 0),
+        places_api_stats.get('cache_verify_failed', 0),
     ]
     try:
         file_exists = os.path.exists(USAGE_LOG_PATH)
@@ -484,6 +496,54 @@ TOLL_PLAZAS = [
     {"name": "KN Hundy", "lat": 12.2130339, "lng": 76.6629785, "car_inr": 55, "highway": "NH275"},
 ]
 
+# Chains recognized to hold reasonably consistent standards across locations in India -- used only
+# as a soft confidence signal folded into the model's verdict wording (e.g. "a recognized chain,
+# consistent standards across locations"). Deliberately NOT a substitute for real per-place data --
+# this must never be used to claim or imply a specific fact (restroom, hours, parking) that isn't
+# separately confirmed by get_place_details_and_reviews. That's the exact mistake this app is meant
+# to avoid (see the restroom_available fix above): a place-level claim needs place-level evidence,
+# brand reputation alone isn't it.
+RECOGNIZED_CHAINS = [
+    # Pure veg / multi-cuisine restaurant chains
+    "Kailash Parbat", "Saravana Bhavan", "Adyar Ananda Bhavan", "A2B",
+    "Haldiram's", "Haldiram", "Sagar Ratna",
+    # Cafes
+    "Chaayos", "Third Wave Coffee", "Cafe Coffee Day", "Café Coffee Day", "Starbucks",
+    # Fuel stations -- deliberately limited to the two brands actually asked for, not every PSU/
+    # private operator, since brand alone here is standing in for "generally well-maintained
+    # facilities," which doesn't hold evenly across every fuel brand in India.
+    "Jio-bp", "Jio BP", "Shell",
+    # Highway wayside amenity operators -- purpose-built rest stops combining fuel, multi-cuisine
+    # food, and restrooms under one roof, explicitly built around consistent hygiene standards
+    # (unlike a single independent roadside dhaba/pump, which is exactly the kind of place this
+    # list should NOT cover on brand alone).
+    "Big Bay", "Cube Stop", "PATH Recharge", "Highway Star",
+]
+
+# India's emergency numbers -- real, nationwide constants, not something to look up per trip or
+# trust the model to remember to mention. 112 is the unified ERSS number (police/fire/ambulance/
+# other services in one line, confirmed live via web search, operational in every state/UT since
+# 2019); 100/101/108 are the older separate lines some people still know by heart. Rendered directly
+# by code (render_plan_cards below), not routed through the model or the response schema at all --
+# static data has no business depending on a language model to reproduce it correctly every time.
+EMERGENCY_NUMBERS = [
+    ("112", "All-in-one emergency number (police, fire, ambulance) -- works everywhere in India"),
+    ("100", "Police"),
+    ("101", "Fire"),
+    ("108", "Ambulance"),
+]
+
+
+def _match_recognized_chain(place_name: str) -> str | None:
+    """Returns the matched brand name from RECOGNIZED_CHAINS if place_name contains one (case
+    -insensitive substring match), else None. A plain name match, not a claim about that specific
+    location -- see the caveat on RECOGNIZED_CHAINS above."""
+    name_lower = place_name.lower()
+    for brand in RECOGNIZED_CHAINS:
+        if brand.lower() in name_lower:
+            return brand
+    return None
+
 
 @st.cache_resource(show_spinner=False)
 def _get_toll_plazas_worksheet():
@@ -556,6 +616,105 @@ def _persist_learned_plazas(new_plazas: list[dict]):
                                plaza.get("highway", "unknown"), timestamp])
     except Exception:
         logger.exception("failed to persist learned toll plazas")
+
+
+# get_place_details_and_reviews's shared cache, in the same spreadsheet as the toll-plaza data
+# above -- reuses the same infra rather than standing up separate storage. Freshness policy:
+#   - under 30 days old: reuse the cached result outright, no API call at all.
+#   - 30-90 days old: one cheap recheck call (businessStatus + rating only, Pro/Enterprise-tier
+#     pricing -- roughly half the cost of the full Enterprise+Atmosphere details lookup) to see if
+#     anything looks different; only pay for a full refresh if it does.
+#   - over 90 days old, or never cached: full fetch, same as today, then cached for next time.
+# This is what makes "another user asks about the same place a week later" fast and cheap instead
+# of re-paying for the same $40/1K lookup -- place_id is a stable, real identity to key on, unlike
+# search_places_along_route's break points, which shift with every route.
+_PLACE_CACHE_FRESH_DAYS = 30
+_PLACE_CACHE_VERIFY_DAYS = 90
+_PLACE_CACHE_RATING_DRIFT_THRESHOLD = 0.3  # a rating move bigger than this is treated as "changed"
+
+
+@st.cache_resource(show_spinner=False)
+def _get_place_cache_worksheet():
+    """Opens (creating if needed) a 'place_details_cache' tab in the shared usage-log spreadsheet.
+    Returns None (falls back to fetching fresh every time, never caching) when credentials/
+    USAGE_SHEET_ID aren't set or the Sheet can't be reached -- same fallback philosophy as the toll
+    plaza cache above."""
+    creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS_JSON")
+    sheet_id = os.environ.get("USAGE_SHEET_ID")
+    if not creds_json or not sheet_id:
+        return None
+    try:
+        import gspread
+        gc = gspread.service_account_from_dict(json.loads(creds_json))
+        spreadsheet = gc.open_by_key(sheet_id)
+        try:
+            sheet = spreadsheet.worksheet("place_details_cache")
+        except gspread.exceptions.WorksheetNotFound:
+            sheet = spreadsheet.add_worksheet(title="place_details_cache", rows=2000, cols=5)
+            sheet.append_row(["place_id", "name", "cached_at", "rating_at_cache", "details_json"])
+        return sheet
+    except Exception:
+        logger.exception("failed to connect to the place_details_cache worksheet")
+        return None
+
+
+def _load_place_details_cache() -> dict:
+    """Reads the whole place_details_cache sheet fresh on every call (deliberately NOT
+    @st.cache_resource, unlike the toll plaza reads above) -- unlike toll plazas, which are a
+    slow-changing supplementary table, this cache's whole value is reflecting writes from other
+    users' recent requests, not just whatever this server process saw since it last restarted.
+    Returns {} on any failure or if the Sheet isn't configured -- every caller already treats a
+    cache miss as "just fetch it," so an empty cache degrades to today's always-fetch behavior."""
+    sheet = _get_place_cache_worksheet()
+    if sheet is None:
+        return {}
+    try:
+        cache = {}
+        all_values = sheet.get_all_values()
+        for row_index, row in enumerate(all_values[1:], start=2):  # row 1 is the header
+            if len(row) < 5:
+                continue
+            place_id, name, cached_at_str, rating_str, details_json = row[:5]
+            try:
+                cached_at = datetime.fromisoformat(cached_at_str)
+                details = json.loads(details_json)
+            except (ValueError, json.JSONDecodeError):
+                continue
+            rating_at_cache = float(rating_str) if rating_str else None
+            cache[place_id] = {
+                "row": row_index, "name": name, "cached_at": cached_at,
+                "rating_at_cache": rating_at_cache, "details": details,
+            }
+        return cache
+    except Exception:
+        logger.exception("failed to load the place_details_cache Sheet")
+        return {}
+
+
+def _persist_place_details_cache(cache: dict, entries: list[dict]):
+    """Upserts entries (each {'place_id', 'name', 'cached_at' (datetime), 'rating_at_cache',
+    'details'}) into the place_details_cache Sheet -- updates the existing row if 'cache' (from
+    _load_place_details_cache) already had one for that place_id, else appends a new row.
+    Best-effort: a failure here just means this place gets fetched fresh again next time, not a
+    broken plan -- never let this raise into the caller."""
+    sheet = _get_place_cache_worksheet()
+    if sheet is None or not entries:
+        return
+    try:
+        for entry in entries:
+            row_values = [
+                entry["place_id"], entry.get("name", ""),
+                entry["cached_at"].isoformat(timespec="seconds"),
+                entry["rating_at_cache"] if entry.get("rating_at_cache") is not None else "",
+                json.dumps(entry["details"], ensure_ascii=False),
+            ]
+            existing = cache.get(entry["place_id"])
+            if existing:
+                sheet.update(f"A{existing['row']}:E{existing['row']}", [row_values])
+            else:
+                sheet.append_row(row_values)
+    except Exception:
+        logger.exception("failed to persist the place_details_cache Sheet")
 
 
 # tolltax.in uses older/common city names in its URLs, not always what Google's formatted address
@@ -671,6 +830,15 @@ def calculate_route_and_etas(origin: str, destination: str, departure_time_iso: 
     """
     Calculates the route between an origin and destination, providing total duration, distance,
     estimated toll cost, and estimated arrival times (ETAs) for major milestones, considering traffic.
+
+    Also returns 'waypoints': a handful of real points along the route (one roughly every ~2 hours
+    of actual driving, not distance), each with a real, traffic-aware 'estimated_arrival_iso' from a
+    second Routes API call -- not the model's own arithmetic from total trip duration. Use these, not a guess, whenever
+    reasoning about what time you'd actually reach a specific stretch of the route (e.g. deciding
+    whether a stop lands in a meal window) -- traffic can move a stop's real arrival time by 10-20+
+    minutes versus a flat proportional estimate, which is exactly the gap between "looks like a great
+    lunch spot" and "you'll actually get there at 2:30pm." May be null/empty if this enrichment call
+    failed; the rest of the response is unaffected either way.
     """
     api_key = st.session_state.get("google_maps_api_key")
     if not api_key:
@@ -824,19 +992,95 @@ def calculate_route_and_etas(origin: str, destination: str, departure_time_iso: 
     # (the model corrupting this ~8-9KB opaque string when passing it back as an argument).
     st.session_state.route_polyline = route['polyline']['encodedPolyline']
 
+    # A second, real Routes API call for real traffic-aware timing at a few points along the route
+    # -- not just the trip's start/end. Two calls, not the model's own guesswork: without this, the
+    # per-stop times a plan shows (e.g. "reach lunch at 1pm") were the model estimating from total
+    # trip duration alone, which is exactly the kind of unverified claim this app is trying to get
+    # away from -- verified directly: at 7:30pm on a real Bengaluru->Ooty route, one leg's real
+    # traffic-aware duration differed from its no-traffic estimate by over 12 minutes. This also
+    # replaces guessing *where* to search for places (see search_places_along_route) with genuinely
+    # time-informed positions instead of a flat km-based assumption.
+    route_cum = route_cumulative_km(route_path)
+    route_total_km = route_cum[-1] if route_cum else 0.0
+    total_duration_seconds = int(route['duration'].replace('s', ''))
+    waypoints = []
+    if route_path and route_total_km > 0:
+        # ~2-hour driving segments, not distance -- a 267km/5h40m trip gets 2 midpoints (3
+        # segments), a slower 267km ghat-heavy trip would get more than a flat highway trip
+        # covering the same distance in less time. This is only used to pick HOW MANY points to
+        # ask about; WHERE those points sit still has to use distance fraction along the route
+        # (no finer-grained per-point timing exists before the second call below runs) -- only the
+        # *count* of segments is duration-based now, not the positions themselves.
+        interval_seconds = 2 * 3600
+        n_mid = max(0, min(6, round(total_duration_seconds / interval_seconds) - 1))
+        guess_fractions = [(i + 1) / (n_mid + 1) for i in range(n_mid)]
+        guess_coords, seen_km = [], []
+        for frac in guess_fractions:
+            target_km = route_total_km * frac
+            if any(abs(target_km - k) < 15 for k in seen_km):
+                continue
+            idx = min(range(len(route_cum)), key=lambda j: abs(route_cum[j] - target_km))
+            guess_coords.append(route_path[idx])
+            seen_km.append(route_cum[idx])
+
+        if guess_coords:
+            waypoints_url = "https://routes.googleapis.com/directions/v2:computeRoutes"
+            waypoints_headers = {
+                "Content-Type": "application/json",
+                "X-Goog-Api-Key": api_key,
+                "X-Goog-FieldMask": "routes.legs.duration,routes.legs.staticDuration,routes.legs.distanceMeters",
+            }
+            waypoints_data = {
+                "origin": {"address": origin},
+                "destination": {"address": destination},
+                "intermediates": [{"location": {"latLng": {"latitude": lat, "longitude": lng}}} for lat, lng in guess_coords],
+                "departureTime": departure_time_iso,
+                "travelMode": "DRIVE",
+                "routingPreference": "TRAFFIC_AWARE",
+                "languageCode": "en-US",
+                "units": "METRIC",
+            }
+            try:
+                wp_response = _api_request("POST", waypoints_url, headers=waypoints_headers, json_body=waypoints_data)
+                if wp_response.ok:
+                    wp_legs = wp_response.json().get('routes', [{}])[0].get('legs', [])
+                    cursor = parsed_departure if parsed_departure and parsed_departure > now else datetime.fromisoformat(departure_time_iso.replace('Z', '+00:00'))
+                    cursor_km = 0.0
+                    for (lat, lng), leg in zip(guess_coords, wp_legs):
+                        leg_seconds = int(leg.get('duration', '0s').rstrip('s'))
+                        cursor = cursor + timedelta(seconds=leg_seconds)
+                        cursor_km += leg.get('distanceMeters', 0) / 1000.0
+                        waypoints.append({
+                            "lat": lat, "lng": lng, "km_from_origin": round(cursor_km),
+                            "estimated_arrival_iso": cursor.isoformat().replace('+00:00', 'Z'),
+                        })
+                else:
+                    print(f"[calculate_route_and_etas] waypoint timing call failed: {wp_response.status_code}: {wp_response.text}", flush=True)
+            except requests.RequestException as exc:
+                print(f"[calculate_route_and_etas] waypoint timing call failed: {exc}", flush=True)
+    # Best-effort: if this failed or found nothing, search_places_along_route falls back to its own
+    # distance-only guess (see its _fallback_break_points) rather than the whole plan failing over a
+    # secondary enrichment call.
+    st.session_state.route_waypoints = waypoints
+
     return {
-        "total_duration_seconds": int(route['duration'].replace('s', '')),
+        "total_duration_seconds": total_duration_seconds,
         "total_distance_meters": route['distanceMeters'],
         "legs": legs,
-        "estimated_toll_cost": estimated_toll
+        "estimated_toll_cost": estimated_toll,
+        "waypoints": [
+            {"km_from_origin": w["km_from_origin"], "estimated_arrival_iso": w["estimated_arrival_iso"]}
+            for w in waypoints
+        ] or None,
     }
 
 
 @timed_tool
 def search_places_along_route(categories: list[str]) -> dict:
     """
-    Searches for places along the current route matching one or more free-text queries. Uses the
-    route from the most recent calculate_route_and_etas call -- call that first.
+    Searches for places near a handful of specific points chosen along the current route, for one
+    or more free-text queries. Uses the route from the most recent calculate_route_and_etas call --
+    call that first.
 
     There is no 'encoded_polyline' parameter on purpose: an earlier version had the model pass the
     route polyline as an argument, and it was observed corrupting the ~8-9KB opaque string in
@@ -860,26 +1104,99 @@ def search_places_along_route(categories: list[str]) -> dict:
 
     Pass every distinct kind of stop the trip needs in ONE call instead of calling this once per
     category -- each call is a full round trip through the model's own reasoning (observed at
-    30-80+ seconds apiece, versus ~1s for the underlying Places lookup itself), so one call
+    30-80+ seconds apiece, versus ~1s for the underlying Places lookups themselves), so one call
     covering N categories is dramatically faster than N separate calls, the same reasoning
     get_place_details_and_reviews below already applies to batching place_ids.
 
+    HOW RESULTS ARE FOUND (changed this pass -- see _break_points): rather than one broad query
+    covering the whole route and hoping Google's own ranking happens to spread out (it doesn't --
+    a single query was observed returning almost every result from the dense origin city, since it
+    has vastly more high-rated places than sparse highway stretches further out), this first decides
+    WHERE along the route actually makes sense to look -- roughly every ~2 hours of actual driving
+    (traffic-aware when calculate_route_and_etas's second call succeeded, distance-approximated
+    otherwise), plus the start and end -- then runs a real, separately-scoped search at each of
+    those points. This is a real fix to the search itself, not a filter applied after the fact to
+    whatever Google happened to return.
+
+    ALWAYS include these four base categories in every call, regardless of what the user explicitly
+    asked for, in addition to anything else the trip specifically needs (e.g. a pharmacy, an ATM,
+    a grocery run): a food/restaurant query (phrased for any stated dietary preference, e.g. "pure
+    vegetarian restaurant"), a fuel/petrol station query, a hospital/emergency care query, and a tea
+    /snacks query. This exists because a plan that only covers what the user thought to ask for is
+    exactly the kind of gap this app is meant to close -- nobody remembers to ask "are there
+    hospitals nearby" until they need one. See the system prompt's Base Category Rubric for the
+    per-category detail (what to look for, how to phrase each query, what fields matter for it).
+
     Returns {"results_by_category": {category: {"places": [...]} | {"error": "..."}}} -- one entry
     per requested category, each independently either a places list or an error, so one bad/empty
-    category never blocks the results for the others.
+    category never blocks the results for the others. Each place includes 'distance_from_origin_km'
+    (a real number computed from the route geometry, not a guess) -- copy it into the option's
+    'location_text'/verdict (e.g. "~165 km into the trip" or "right at departure") so the user can
+    tell at a glance whether a stop is actually along their route or just near where they're
+    starting from.
+
+    Each place also includes 'recognized_chain' -- non-null only when the place's name matched a
+    known brand (see RECOGNIZED_CHAINS) known to hold reasonably consistent standards across
+    locations in India. This is a soft, name-based signal for verdict tone (e.g. "a recognized
+    chain, consistent standards across locations") -- NOT evidence for any specific fact. Never use
+    it to state or imply restroom availability, hours, or anything else that get_place_details_and_
+    reviews's real per-place fields already cover -- those facts, when available, always win.
     """
     encoded_polyline = st.session_state.get('route_polyline')
     if not encoded_polyline:
         return {"error": "No route has been calculated yet -- call calculate_route_and_etas first."}
 
+    # Reuses route_cumulative_km/distance_along_route_km already built for The Strip's own
+    # visualization -- same geometry, different use here (choosing where to search).
+    route_path = decode_polyline(encoded_polyline)
+    route_cum = route_cumulative_km(route_path)
+    route_total_km = route_cum[-1] if route_cum else 0.0
+
     api_key = st.session_state.get("google_maps_api_key")
     if not api_key:
         return {"error": "GOOGLE_MAPS_API_KEY is not configured on the server."}
 
-    # There is no dedicated "search along route" endpoint in the Places API (New) -- that's a
-    # parameter (searchAlongRouteParameters) on ordinary Text Search, not its own URL. An earlier
-    # version of this app called a nonexistent places:searchAlongRoute endpoint, which 404'd every
-    # time and drove the model to hallucinate a placeholder place_id to keep going.
+    def _fallback_break_points() -> list[tuple[float, float, float]]:
+        """Used only if calculate_route_and_etas's real, traffic-timed waypoints aren't available
+        (its second Routes API call failed) -- a distance-only guess at the same ~2-hour-segment
+        idea, always including start and end, but with no real timing behind it: there's no per-leg
+        duration to work from here, so the ~2hr target is approximated via an assumed 55 km/h
+        average Indian highway speed (accounting for traffic/tolls/curves, not a free-flow speed)
+        -- i.e. roughly every ~110km. Points closer than ~15km apart collapse to one. Returns
+        (lat, lng, km_from_origin) tuples."""
+        if not route_path or route_total_km <= 0:
+            return []
+        assumed_kmh = 55.0
+        interval_km = assumed_kmh * 2.0
+        n_mid = max(0, min(6, round(route_total_km / interval_km) - 1))
+        fractions = [0.0] + [(i + 1) / (n_mid + 1) for i in range(n_mid)] + [1.0]
+        points, seen_km = [], []
+        for frac in fractions:
+            target_km = route_total_km * frac
+            if any(abs(target_km - k) < 15 for k in seen_km):
+                continue
+            idx = min(range(len(route_cum)), key=lambda j: abs(route_cum[j] - target_km))
+            lat, lng = route_path[idx]
+            points.append((lat, lng, route_cum[idx]))
+            seen_km.append(route_cum[idx])
+        return points
+
+    # Prefer the real, traffic-timed waypoints calculate_route_and_etas already computed (a second
+    # Routes API call with real arrival times) over guessing again from scratch here -- those were
+    # validated against real traffic, this fallback wasn't. Always add the start and end as anchors
+    # too (a genuine "eat before you leave" / "near arrival" option is legitimate), since those
+    # waypoints only cover the intermediate points, not the trip's own start/end.
+    stored_waypoints = st.session_state.get('route_waypoints') or []
+    if stored_waypoints and route_path:
+        break_points = [(route_path[0][0], route_path[0][1], 0.0)]
+        break_points += [(w['lat'], w['lng'], w['km_from_origin']) for w in stored_waypoints]
+        break_points.append((route_path[-1][0], route_path[-1][1], route_total_km))
+    else:
+        break_points = _fallback_break_points()
+
+    # There is no dedicated "search near a point" endpoint distinct from ordinary Text Search in
+    # the Places API (New) -- locationBias is just a parameter on the same searchText call
+    # search_places_along_route used to use with searchAlongRouteParameters instead.
     url = "https://places.googleapis.com/v1/places:searchText"
     headers = {
         "Content-Type": "application/json",
@@ -887,82 +1204,79 @@ def search_places_along_route(categories: list[str]) -> dict:
         "X-Goog-FieldMask": "places.id,places.displayName.text,places.rating,places.userRatingCount,places.location,places.types,places.formattedAddress"
     }
 
-    def _search_new(category: str):
+    def _search_new(category: str, lat: float, lng: float):
         data = {
             "textQuery": category,
-            "searchAlongRouteParameters": {"polyline": {"encodedPolyline": encoded_polyline}},
-            "pageSize": 20,
+            "locationBias": {"circle": {"center": {"latitude": lat, "longitude": lng}, "radius": 12000.0}},
+            "pageSize": 8,
             "languageCode": "en-US",
             "minRating": 3.5,
         }
         try:
             response = _api_request("POST", url, headers=headers, json_body=data)
         except requests.RequestException as exc:
-            print(f"[search_places_along_route] category={category!r} polyline_len={len(encoded_polyline)} request failed: {exc}", flush=True)
+            print(f"[search_places_along_route] category={category!r} point=({lat:.4f},{lng:.4f}) request failed: {exc}", flush=True)
             return None, f"Places API (New) request failed: {exc}"
         if not response.ok:
             # _api_request already retried transient 5xx a couple of times -- this is logged (error
             # path only, not per-call) so a recurrence past those retries still shows in server logs.
-            print(f"[search_places_along_route] category={category!r} polyline_len={len(encoded_polyline)} HTTP {response.status_code}: {response.text}", flush=True)
+            print(f"[search_places_along_route] category={category!r} point=({lat:.4f},{lng:.4f}) HTTP {response.status_code}: {response.text}", flush=True)
             return None, f"Places API (New) error {response.status_code}: {response.text}"
         return response.json().get('places', []), None
 
-    def _search_legacy(category: str):
-        # Fallback for when Places API (New) is down/failing -- the legacy Places API has no
-        # "search along route" parameter at all, so this approximates it by running a Nearby Search
-        # around a handful of points sampled along the route polyline and merging/deduping the
-        # results, instead of one precise along-route query. Normalizes into the exact same shape
-        # _search_new returns (a New-API-style 'places' list) so every line below this point stays
-        # identical regardless of which tier actually served the data.
-        path = decode_polyline(encoded_polyline)
-        if not path:
-            return None, "no route polyline available for the legacy fallback"
-        sample_n = min(4, len(path))
-        step = (len(path) - 1) / (sample_n - 1) if sample_n > 1 else 0
-        points = [path[round(i * step)] for i in range(sample_n)]
-
-        seen = {}
-        for lat, lng in points:
-            params = {"location": f"{lat},{lng}", "radius": 15000, "keyword": category, "key": api_key}
-            try:
-                response = _api_request("GET", "https://maps.googleapis.com/maps/api/place/nearbysearch/json", params=params)
-            except requests.RequestException:
+    def _search_legacy(category: str, lat: float, lng: float):
+        # Fallback for when Places API (New) is down/failing -- the legacy Nearby Search endpoint
+        # does the same "search near this point" job with a different request/response shape.
+        # Normalizes into the exact same shape _search_new returns (a New-API-style 'places' list)
+        # so every line below this point stays identical regardless of which tier served the data.
+        params = {"location": f"{lat},{lng}", "radius": 12000, "keyword": category, "key": api_key}
+        try:
+            response = _api_request("GET", "https://maps.googleapis.com/maps/api/place/nearbysearch/json", params=params)
+        except requests.RequestException as exc:
+            return None, f"Places API (legacy) request failed: {exc}"
+        if not response.ok:
+            return None, f"Places API (legacy) error {response.status_code}: {response.text}"
+        places = []
+        for r in response.json().get('results', []):
+            place_id = r.get('place_id')
+            if not place_id or (r.get('rating') or 0) < 3.5:
                 continue
-            if not response.ok:
-                continue
-            for r in response.json().get('results', []):
-                place_id = r.get('place_id')
-                if not place_id or place_id in seen or (r.get('rating') or 0) < 3.5:
-                    continue
-                loc = r.get('geometry', {}).get('location', {})
-                seen[place_id] = {
-                    "id": place_id,
-                    "displayName": {"text": r.get('name', '')},
-                    "rating": r.get('rating'),
-                    "userRatingCount": r.get('user_ratings_total'),
-                    "formattedAddress": r.get('vicinity', ''),
-                    "types": r.get('types', []),
-                    "location": {"latitude": loc.get('lat'), "longitude": loc.get('lng')},
-                }
-        if not seen:
+            loc = r.get('geometry', {}).get('location', {})
+            places.append({
+                "id": place_id,
+                "displayName": {"text": r.get('name', '')},
+                "rating": r.get('rating'),
+                "userRatingCount": r.get('user_ratings_total'),
+                "formattedAddress": r.get('vicinity', ''),
+                "types": r.get('types', []),
+                "location": {"latitude": loc.get('lat'), "longitude": loc.get('lng')},
+            })
+        if not places:
             return None, "legacy Places API returned no results either"
-        return list(seen.values()), None
+        return places, None
 
-    def _fetch(category: str):
+    def _fetch_at_point(category: str, lat: float, lng: float, km: float):
         # Runs in a worker thread -- network I/O only, no st.session_state access (see the note in
         # get_place_details_and_reviews below for why that matters).
-        places, error = _search_new(category)
+        places, error = _search_new(category, lat, lng)
         source = "new"
         if error:
-            print(f"[search_places_along_route] category={category!r} falling back to legacy Places API after: {error}", flush=True)
-            places, legacy_error = _search_legacy(category)
+            print(f"[search_places_along_route] category={category!r} point=({lat:.4f},{lng:.4f}) falling back to legacy Places API after: {error}", flush=True)
+            places, legacy_error = _search_legacy(category, lat, lng)
             source = "legacy"
             if legacy_error:
-                return category, None, f"Both Places APIs failed -- new: {error}; legacy: {legacy_error}", "failed"
-        return category, places, None, source
+                return category, km, None, f"Both Places APIs failed -- new: {error}; legacy: {legacy_error}", "failed"
+        return category, km, places, None, source
 
-    with ThreadPoolExecutor(max_workers=min(8, len(categories)) or 1) as executor:
-        fetched = list(executor.map(_fetch, categories))
+    # One flat batch across every (category, break point) pair -- e.g. 2 categories x 4 points is
+    # 8 parallel requests, but still zero extra round trips through the model's own reasoning, since
+    # this is all still inside the single AFC call this function represents.
+    work_items = [(category, lat, lng, km) for category in categories for (lat, lng, km) in break_points]
+    if not work_items:
+        return {"results_by_category": {c: {"error": "route has no usable geometry to search along"} for c in categories}}
+
+    with ThreadPoolExecutor(max_workers=min(8, len(work_items)) or 1) as executor:
+        fetched = list(executor.map(lambda w: _fetch_at_point(*w), work_items))
 
     if 'discovered_places' not in st.session_state:
         st.session_state.discovered_places = {}
@@ -972,36 +1286,67 @@ def search_places_along_route(categories: list[str]) -> dict:
     # real, trackable number instead of something only visible by reading server logs (see HANDOFF.md).
     api_stats = st.session_state.setdefault('_places_api_stats', {'new': 0, 'legacy': 0, 'failed': 0})
 
-    results_by_category = {}
-    for category, places_data, error, source in fetched:
+    by_category: dict[str, list[tuple[float, list[dict] | None, str | None, str]]] = {c: [] for c in categories}
+    for category, km, places_data, error, source in fetched:
         api_stats[source] = api_stats.get(source, 0) + 1
-        if error:
-            results_by_category[category] = {"error": error}
+        by_category[category].append((km, places_data, error, source))
+
+    results_by_category = {}
+    for category, point_results in by_category.items():
+        if all(error for _km, _places, error, _source in point_results):
+            results_by_category[category] = {"error": "; ".join(error for *_, error, _ in point_results if error)}
             continue
 
         places = []
-        for p_data in places_data[:5]:
+        seen_ids = set()
+        for km, places_data, error, source in point_results:
+            if error or not places_data:
+                continue
+            # Best-rated candidate at this specific point -- one option per break point per
+            # category, so results stay spread across the route instead of clustering wherever one
+            # point happened to return the most/highest-rated raw candidates.
+            candidates = [p for p in places_data if p.get('id') not in seen_ids]
+            if not candidates:
+                continue
+            candidates.sort(key=lambda p: -(p.get('rating') or 0))
+            p_data = candidates[0]
+            seen_ids.add(p_data['id'])
+
+            # The place's own real coordinates give a more precise distance-along-route than the
+            # break point's own km -- they'll usually be close, but the actual place can be a couple
+            # of km off from the point that was searched around.
+            loc = p_data.get('location', {})
+            lat, lng = loc.get('latitude'), loc.get('longitude')
+            precise_km = distance_along_route_km(route_path, route_cum, lat, lng) if lat is not None and lng is not None else km
+
             places.append({
                 "place_id": p_data['id'],
                 "name": p_data['displayName']['text'],
                 "rating": p_data.get('rating'),
                 "user_ratings_total": p_data.get('userRatingCount'),
                 "vicinity": p_data.get('formattedAddress', ''),
-                "types": p_data.get('types', [])[:4]
+                "types": p_data.get('types', [])[:4],
+                # Real, computed position along the route -- not a guess. round()'d to the nearest
+                # km since sub-km precision implies an accuracy nearest-vertex matching doesn't have.
+                "distance_from_origin_km": round(precise_km),
+                # A name match only, not a per-place fact -- see RECOGNIZED_CHAINS' caveat. Null
+                # unless this exact place's name matched one of the listed brands.
+                "recognized_chain": _match_recognized_chain(p_data['displayName']['text']),
             })
 
             # Track every discovered place so the UI can offer a "Navigate" link and a map marker
             # for it later -- the chat response is free-form text, so this is the only reliable
             # source of real place_ids and coordinates. Lat/lng isn't sent to the model, just
             # stashed for the UI.
-            location = p_data.get('location', {})
             st.session_state.discovered_places[p_data['id']] = {
                 "name": p_data['displayName']['text'],
                 "vicinity": p_data.get('formattedAddress', ''),
-                "lat": location.get('latitude'),
-                "lng": location.get('longitude'),
+                "lat": lat, "lng": lng,
             }
 
+        if not places:
+            results_by_category[category] = {"error": "no results at any searched point along the route"}
+            continue
         results_by_category[category] = {"places": places}
 
     return {"results_by_category": results_by_category}
@@ -1023,6 +1368,22 @@ def get_place_details_and_reviews(place_ids: list[str]) -> dict:
     posted, to gauge whether the rating still reflects the place today) and 'critical_review' (the
     most unfavorable review Google returned, only present if it's actually <=3 stars -- null if
     every review Google returned was positive) alongside the usual top reviews.
+
+    Also includes 'restroom_available' -- Google's own per-place restroom signal, not a guess. This
+    exists because a place's category or cuisine was previously being used to imply restroom
+    availability across a whole list of options (e.g. "we picked restaurants with clean restrooms")
+    even when most individual places never actually confirmed it -- restroom_available must be read
+    and stated per place, never assumed from category, chain, or a restroom search run elsewhere.
+
+    Results are cached across users/sessions by place_id (see _PLACE_CACHE_FRESH_DAYS and friends
+    above) -- a place looked up recently is reused outright, one looked up a while ago gets a cheap
+    recheck before being trusted again, and only a genuinely stale or never-seen place pays for the
+    full lookup below. Entirely transparent to the caller: the shape of what's returned is identical
+    either way.
+
+    Also includes 'phone' -- Google's own listed number for that exact place, nullable if Google
+    doesn't have one. Matters most for hospital/emergency options, where a name and a rating alone
+    aren't actually useful in an emergency.
     """
     api_key = st.session_state.get("google_maps_api_key")
     if not api_key:
@@ -1033,7 +1394,7 @@ def get_place_details_and_reviews(place_ids: list[str]) -> dict:
         "X-Goog-Api-Key": api_key,
         # currentOpeningStatus is NOT a real field on the Place resource (it 400s) -- the actual
         # field for "is it open right now" is currentOpeningHours.openNow, mapped below.
-        "X-Goog-FieldMask": "id,displayName.text,rating,userRatingCount,formattedAddress,nationalPhoneNumber,websiteUri,currentOpeningHours,priceLevel,regularOpeningHours,reviews,servesBreakfast,servesLunch,servesDinner,servesVegetarianFood,parkingOptions,photos"
+        "X-Goog-FieldMask": "id,displayName.text,rating,userRatingCount,formattedAddress,nationalPhoneNumber,websiteUri,currentOpeningHours,priceLevel,regularOpeningHours,reviews,servesBreakfast,servesLunch,servesDinner,servesVegetarianFood,parkingOptions,photos,restroom"
     }
 
     def _details_new(place_id: str):
@@ -1089,6 +1450,7 @@ def get_place_details_and_reviews(place_ids: list[str]) -> dict:
             "parkingOptions": {},
             "reviews": reviews,
             "photos": [],
+            "restroom": None,
         }, None
 
     def _fetch(place_id: str):
@@ -1106,23 +1468,10 @@ def get_place_details_and_reviews(place_ids: list[str]) -> dict:
                 return place_id, None, f"Both Places APIs failed -- new: {error}; legacy: {legacy_error}", "failed"
         return place_id, details_data, None, source
 
-    # Fetched in parallel -- these are independent GET requests, one per candidate place, previously
-    # issued one at a time so total latency scaled with the number of places being evaluated instead
-    # of the slowest single one.
-    with ThreadPoolExecutor(max_workers=min(8, len(place_ids)) or 1) as executor:
-        fetched = list(executor.map(_fetch, place_ids))
-
-    # See the matching comment in search_places_along_route -- same tracked-tier pattern, same key,
-    # so one request's stats cover both tools' underlying Places calls together.
-    api_stats = st.session_state.setdefault('_places_api_stats', {'new': 0, 'legacy': 0, 'failed': 0})
-
-    results = []
-    for place_id, details_data, error, source in fetched:
-        api_stats[source] = api_stats.get(source, 0) + 1
-        if error:
-            results.append({"place_id": place_id, "error": error})
-            continue
-
+    def _process(details_data: dict) -> tuple[dict, str | None]:
+        """Turns a raw Places API response into (model-visible dict, photo_name) -- factored out of
+        the fetch loop so a cache write can store exactly what a future cache hit will replay,
+        instead of the two ever being able to drift apart."""
         # Process every review Google actually returns (New Places API caps this at 5) before
         # slicing anything down -- picking the "top 3" first, as this used to, meant recency and
         # any negative review nearly always got cut before they were even looked at, since Google's
@@ -1160,8 +1509,18 @@ def get_place_details_and_reviews(place_ids: list[str]) -> dict:
             ] if parking_options.get(flag)
         ]
 
-        results.append({
-            "place_id": place_id,
+        # Google's own confirmed signal, not a guess -- 'restroom' is present/absent on the Place
+        # resource itself. Missing from the response means Google hasn't confirmed either way, which
+        # is a different, weaker claim than "no restroom" and needs to read as unconfirmed, not absent.
+        restroom_flag = details_data.get('restroom')
+        if restroom_flag is True:
+            restroom_text = "Confirmed by Google"
+        elif restroom_flag is False:
+            restroom_text = "Google indicates no restroom at this location"
+        else:
+            restroom_text = "Not confirmed by Google -- verify locally if this matters"
+
+        model_dict = {
             "opening_hours": details_data.get('regularOpeningHours'),
             "reviews": reviews,
             "most_recent_review": (
@@ -1187,14 +1546,114 @@ def get_place_details_and_reviews(place_ids: list[str]) -> dict:
             "serves_lunch": details_data.get('servesLunch'),
             "serves_dinner": details_data.get('servesDinner'),
             "serves_vegetarian_food": details_data.get('servesVegetarianFood'),
-            "parking_available": available_parking if available_parking else "Not listed by Google -- mention this is unverified if parking matters for this trip"
-        })
-
-        # Not sent to the model (not useful context, just tokens) -- stashed for the UI to render a photo.
+            "parking_available": available_parking if available_parking else "Not listed by Google -- mention this is unverified if parking matters for this trip",
+            "restroom_available": restroom_text,
+            # Google's own listed number for this exact place -- not looked up separately, just
+            # finally surfaced (the field was already in the mask, unused). Matters most for
+            # hospitals/emergency options, where a name and a rating alone aren't actually useful.
+            "phone": details_data.get('nationalPhoneNumber'),
+        }
         photos = details_data.get('photos', [])
-        if place_id in st.session_state.get('discovered_places', {}) and photos:
-            st.session_state.discovered_places[place_id]['photo_name'] = photos[0]['name']
+        photo_name = photos[0]['name'] if photos else None
+        return model_dict, photo_name
 
+    # See the matching comment in search_places_along_route -- same tracked-tier pattern, same key,
+    # so one request's stats cover both tools' underlying Places calls together.
+    api_stats = st.session_state.setdefault('_places_api_stats', {'new': 0, 'legacy': 0, 'failed': 0})
+    now = datetime.now(timezone.utc)
+    cache = _load_place_details_cache()
+
+    def _emit(place_id: str, model_dict: dict, photo_name: str | None):
+        """Appends the model-visible result and, if this session's discovered_places already knows
+        about this place_id (populated by search_places_along_route earlier in this same request),
+        stashes its photo for the UI -- shared by every path (cache-fresh, cache-verified, freshly
+        fetched) so this bookkeeping can't accidentally be skipped for a cache hit."""
+        results.append({"place_id": place_id, **model_dict})
+        if photo_name and place_id in st.session_state.get('discovered_places', {}):
+            st.session_state.discovered_places[place_id]['photo_name'] = photo_name
+
+    results = []
+    cache_writes = []
+    to_fetch = []
+    to_verify = []
+    for place_id in place_ids:
+        entry = cache.get(place_id)
+        if not entry:
+            to_fetch.append(place_id)
+            continue
+        age_days = (now - entry['cached_at']).days
+        if age_days <= _PLACE_CACHE_FRESH_DAYS:
+            _emit(place_id, entry['details']['model'], entry['details'].get('photo_name'))
+            api_stats['cache_fresh'] = api_stats.get('cache_fresh', 0) + 1
+        elif age_days <= _PLACE_CACHE_VERIFY_DAYS:
+            to_verify.append((place_id, entry))
+        else:
+            to_fetch.append(place_id)
+
+    # Cheap recheck pass for aging-but-not-yet-stale entries -- one small GET per place (Pro/
+    # Enterprise-tier pricing, no reviews/photos/hours requested), in parallel. Any failure here
+    # (network error, non-200, an actual change) falls through to a full fetch rather than risking
+    # trusting stale data -- this recheck's whole job is to catch drift, so it must never silently
+    # swallow a case where it couldn't actually confirm nothing changed.
+    def _cheap_recheck(place_id: str, entry: dict):
+        verify_headers = {
+            "Content-Type": "application/json", "X-Goog-Api-Key": api_key,
+            "X-Goog-FieldMask": "businessStatus,rating",
+        }
+        try:
+            response = _api_request(
+                "GET", f"https://places.googleapis.com/v1/places/{place_id}", headers=verify_headers
+            )
+        except requests.RequestException:
+            return place_id, entry, False
+        if not response.ok:
+            return place_id, entry, False
+        data = response.json()
+        if data.get('businessStatus', 'OPERATIONAL') != 'OPERATIONAL':
+            return place_id, entry, False
+        new_rating, old_rating = data.get('rating'), entry.get('rating_at_cache')
+        if new_rating is not None and old_rating is not None and abs(new_rating - old_rating) > _PLACE_CACHE_RATING_DRIFT_THRESHOLD:
+            return place_id, entry, False
+        return place_id, entry, True
+
+    if to_verify:
+        with ThreadPoolExecutor(max_workers=min(8, len(to_verify)) or 1) as executor:
+            verify_results = list(executor.map(lambda pe: _cheap_recheck(*pe), to_verify))
+        for place_id, entry, unchanged in verify_results:
+            api_stats['cache_verified' if unchanged else 'cache_verify_failed'] = (
+                api_stats.get('cache_verified' if unchanged else 'cache_verify_failed', 0) + 1
+            )
+            if unchanged:
+                _emit(place_id, entry['details']['model'], entry['details'].get('photo_name'))
+                # Nothing changed -- just refresh cached_at so this entry doesn't get re-verified
+                # again immediately next time; keep the same rating/details already on file.
+                cache_writes.append({
+                    "place_id": place_id, "name": entry.get('name', ''), "cached_at": now,
+                    "rating_at_cache": entry.get('rating_at_cache'), "details": entry['details'],
+                })
+            else:
+                to_fetch.append(place_id)
+
+    # Full fetch for whatever's genuinely stale, never seen, or failed its cheap recheck --
+    # identical to the original always-fetch behavior below.
+    if to_fetch:
+        with ThreadPoolExecutor(max_workers=min(8, len(to_fetch)) or 1) as executor:
+            fetched = list(executor.map(_fetch, to_fetch))
+
+        for place_id, details_data, error, source in fetched:
+            api_stats[source] = api_stats.get(source, 0) + 1
+            if error:
+                results.append({"place_id": place_id, "error": error})
+                continue
+            model_dict, photo_name = _process(details_data)
+            _emit(place_id, model_dict, photo_name)
+            cache_writes.append({
+                "place_id": place_id, "name": details_data.get('displayName', {}).get('text', ''),
+                "cached_at": now, "rating_at_cache": details_data.get('rating'),
+                "details": {"model": model_dict, "photo_name": photo_name},
+            })
+
+    _persist_place_details_cache(cache, cache_writes)
     return {"details": results}
 
 
@@ -1210,8 +1669,19 @@ def render_copy_and_share(text: str):
     # so this needs an actual iframe via st.iframe instead, which allows real JS.
     st.iframe(
         f"""
+        <style>
+          :root {{ --ink: #1a1a1a; --paper-raised: #ffffff; --line: #b8b6ae; --accent: #b3502c; }}
+          @media (prefers-color-scheme: dark) {{
+            :root {{ --ink: #ece9e2; --paper-raised: #262521; --line: #45433c; --accent: #e08a5c; }}
+          }}
+          .copy-btn {{
+            padding:6px 14px; border-radius:6px; border:1px solid var(--line);
+            background:var(--paper-raised); color:var(--ink); cursor:pointer; font-size:14px;
+          }}
+          .copy-btn:hover {{ border-color: var(--accent); color: var(--accent); }}
+        </style>
         <div style="display:flex; gap:8px; font-family:sans-serif;">
-          <button onclick="
+          <button class="copy-btn" onclick="
             (function(btn){{
               const bytes = Uint8Array.from(atob('{b64}'), c => c.charCodeAt(0));
               const decoded = new TextDecoder('utf-8').decode(bytes);
@@ -1221,7 +1691,7 @@ def render_copy_and_share(text: str):
                 setTimeout(() => {{ btn.innerText = orig; }}, 1500);
               }});
             }})(this)
-          " style="padding:6px 14px; border-radius:6px; border:1px solid #999; background:#f0f2f6; color:#31333F; cursor:pointer; font-size:14px;">📋 Copy</button>
+          ">📋 Copy</button>
           <button onclick="
             (function(btn){{
               const bytes = Uint8Array.from(atob('{b64}'), c => c.charCodeAt(0));
@@ -1318,46 +1788,58 @@ def render_navigate_links():
 
 def render_route_map():
     """Draws the calculated route (decoded from its polyline) with a marker for every discovered
-    place, so the user can see the trip and stops at a glance instead of only reading about them."""
-    polyline = st.session_state.get('route_polyline')
-    if not polyline:
-        return
-    path = decode_polyline(polyline)
-    if not path:
-        return
+    place, so the user can see the trip and stops at a glance instead of only reading about them.
 
-    layers = [pdk.Layer(
-        "PathLayer",
-        data=[{"path": [[lng, lat] for lat, lng in path]}],
-        get_path="path",
-        get_width=5,
-        get_color=[66, 133, 244],
-        width_min_pixels=3,
-    )]
+    Wrapped in a broad try/except: decode_polyline's inner loop has no bounds check, so a
+    genuinely truncated/corrupted polyline raises IndexError -- and since this is called
+    unconditionally after every plan renders, an uncaught exception here wouldn't just break the
+    map, it would crash the ENTIRE page on every single rerun until a brand new plan is started,
+    even though the plan itself succeeded. Found during a review after a similar unguarded-
+    external-data crash was fixed elsewhere (see chat.send_message's error handling). Degrading to
+    no map is a far smaller loss than losing an otherwise-working plan."""
+    try:
+        polyline = st.session_state.get('route_polyline')
+        if not polyline:
+            return
+        path = decode_polyline(polyline)
+        if not path:
+            return
 
-    places = st.session_state.get('discovered_places', {})
-    marker_data = [
-        {"lat": info['lat'], "lng": info['lng'], "name": info['name']}
-        for info in places.values() if info.get('lat') is not None
-    ]
-    if marker_data:
-        layers.append(pdk.Layer(
-            "ScatterplotLayer",
-            data=marker_data,
-            get_position=["lng", "lat"],
-            get_fill_color=[234, 67, 53],
-            get_radius=300,
-            pickable=True,
+        layers = [pdk.Layer(
+            "PathLayer",
+            data=[{"path": [[lng, lat] for lat, lng in path]}],
+            get_path="path",
+            get_width=5,
+            get_color=[66, 133, 244],
+            width_min_pixels=3,
+        )]
+
+        places = st.session_state.get('discovered_places', {})
+        marker_data = [
+            {"lat": info['lat'], "lng": info['lng'], "name": info['name']}
+            for info in places.values() if info.get('lat') is not None
+        ]
+        if marker_data:
+            layers.append(pdk.Layer(
+                "ScatterplotLayer",
+                data=marker_data,
+                get_position=["lng", "lat"],
+                get_fill_color=[234, 67, 53],
+                get_radius=300,
+                pickable=True,
+            ))
+
+        mid_lat, mid_lng = path[len(path) // 2]
+        st.caption("🗺️ Route Map:")
+        st.pydeck_chart(pdk.Deck(
+            map_style=None,
+            initial_view_state=pdk.ViewState(latitude=mid_lat, longitude=mid_lng, zoom=8),
+            layers=layers,
+            tooltip={"text": "{name}"} if marker_data else None,
         ))
-
-    mid_lat, mid_lng = path[len(path) // 2]
-    st.caption("🗺️ Route Map:")
-    st.pydeck_chart(pdk.Deck(
-        map_style=None,
-        initial_view_state=pdk.ViewState(latitude=mid_lat, longitude=mid_lng, zoom=8),
-        layers=layers,
-        tooltip={"text": "{name}"} if marker_data else None,
-    ))
+    except Exception:
+        logger.exception("render_route_map failed")
+        st.caption("🗺️ Route map unavailable for this plan.")
 
 
 def render_place_photos():
@@ -1589,21 +2071,63 @@ def _travel_spirit_data_uri(index: int) -> str:
     return _svg_data_uri(_TRAVEL_SPIRIT_SVGS[index % len(_TRAVEL_SPIRIT_SVGS)])
 
 
+@st.cache_data(show_spinner=False)
+def _lothal_illustration_data_uri() -> str | None:
+    """Base64-encodes lothal_bg.jpg once per server process, not once per rerun -- Streamlit
+    re-executes the whole script on every interaction, so without caching this would re-read and
+    re-encode a ~163KB file on every single click. Returns None if the asset is missing so the
+    caller degrades to no background instead of crashing.
+
+    lothal_bg.jpg is a downscaled/re-compressed JPEG derived from the user's own shared
+    illustration of Lothal (originally a 6MB, 2752x1536 PNG -- far too heavy to embed inline on
+    every rerun). Resized to 1399px wide and re-encoded as JPEG at quality 62: a background shown
+    at 14% opacity doesn't need full photographic fidelity, and this brought it down to ~163KB."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lothal_bg.jpg")
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        data = f.read()
+    return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
+
+
 def render_home_illustrations():
     """Shown only before a trip is planned -- once planning_triggered is set, the actual plan
     (and its own imagery) takes over and this shouldn't linger.
 
-    Deliberately full-width strips with no caption underneath, not boxed side-by-side postcards --
-    these are meant to read as an ambient decorative band behind the header, not as two labeled
-    tourist photos."""
+    A real background layer (CSS background-image on a negative-z-index pseudo-element sized to
+    the whole app container, not a separate element in the page's normal document flow -- a plain
+    full-width <img> here would still sit inside Streamlit's own stMainBlockContainer padding,
+    verified live at 80px left/right, and read as a boxed panel rather than blending in).
+
+    Uses the user's own shared illustration of Lothal (see _lothal_illustration_data_uri), not the
+    hand-authored SVG illustrations in _HOME_ILLUSTRATIONS below -- explicit feedback after trying
+    those: wanted the real shared artwork, not a generated one. _HOME_ILLUSTRATIONS is left defined,
+    just unused here, in case it's wanted again later or reused elsewhere."""
     if st.session_state.get('planning_triggered'):
         return
-    for svg in _HOME_ILLUSTRATIONS:
-        st.markdown(
-            f'<img src="{_svg_data_uri(svg)}" style="width:100%; height:110px; object-fit:cover; '
-            'display:block; margin-bottom:2px;">',
-            unsafe_allow_html=True,
-        )
+    data_uri = _lothal_illustration_data_uri()
+    if not data_uri:
+        return
+    st.markdown(
+        f"""
+        <style>
+        [data-testid="stAppViewContainer"] {{ position: relative; }}
+        [data-testid="stAppViewContainer"]::before {{
+            content: "";
+            position: absolute;
+            inset: 0;
+            background-image: url("{data_uri}");
+            background-size: cover;
+            background-position: center top;
+            background-repeat: no-repeat;
+            opacity: 0.14;
+            z-index: -1;
+            pointer-events: none;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def render_region_postcards():
@@ -1663,18 +2187,21 @@ _OPTION_SCHEMA = {
     "type": "OBJECT",
     "properties": {
         "name": {"type": "STRING"},
+        "location_text": {"type": "STRING", "nullable": True, "description": "REQUIRED whenever this option came from a tool result: copy the 'vicinity' field from search_places_along_route verbatim (e.g. 'NH44, Thandavapura, Karnataka' or 'Magadi Road, Bengaluru') -- a name alone doesn't tell the user whether a stop is near the start of the trip or genuinely along the route ahead of them. Only null for an option with no tool result to read it from."},
         "place_id": {"type": "STRING", "nullable": True, "description": "The place_id from get_place_details_and_reviews, if this option came from a tool result."},
         "rating_text": {"type": "STRING", "nullable": True, "description": "e.g. '4.0 (2,082 reviews)'"},
         "price_level": {"type": "STRING", "nullable": True, "description": "e.g. 'Budget', 'Moderate', 'Expensive'"},
         "hours_status": {"type": "STRING", "nullable": True, "description": "e.g. 'Open now, closes 11:00 PM'"},
         "parking": {"type": "STRING", "nullable": True},
+        "restroom": {"type": "STRING", "nullable": True, "description": "REQUIRED whenever this option came from get_place_details_and_reviews: copy that tool result's 'restroom_available' text verbatim (e.g. 'Confirmed by Google' or 'Not confirmed by Google -- verify locally if this matters'). This is a per-place Google signal -- never state or imply a place has a restroom because of its category, cuisine, chain, or because a restroom search ran elsewhere on the route. Only null for an option with no tool result to read it from."},
+        "phone": {"type": "STRING", "nullable": True, "description": "Copy get_place_details_and_reviews's 'phone' field verbatim when non-null. Especially important for hospital/emergency options -- a name and rating alone aren't useful in an emergency. Null when Google doesn't list one."},
         "elder_suitability": {"type": "STRING", "nullable": True, "description": "Only for food stops when the trip involves elderly travelers."},
         "review_snippet": {"type": "STRING", "nullable": True},
         "review_recency": {"type": "STRING", "nullable": True, "description": "REQUIRED whenever this option came from get_place_details_and_reviews: copy most_recent_review.relative_time verbatim (e.g. '3 weeks ago'). This is what lets the user judge whether the star rating still reflects the place today, not just what it was years ago. Only null for an option with no tool result to read it from."},
         "critical_review_snippet": {"type": "STRING", "nullable": True, "description": "REQUIRED field (value may be null, but the field itself must always be set, never omitted): copy critical_review.text verbatim if get_place_details_and_reviews returned a critical_review for this place, so the user sees a real downside alongside the positive quote -- set explicitly to null only when critical_review was actually null (every review Google returned was positive), never left out just because a bad review would make the option look worse."},
         "verdict": {"type": "STRING", "description": "The concierge's honest, specific take on this option -- pros/cons, not a single winner declaration."},
     },
-    "required": ["name", "verdict", "review_recency", "critical_review_snippet"],
+    "required": ["name", "verdict", "review_recency", "critical_review_snippet", "location_text", "restroom"],
 }
 
 _STOP_CATEGORY_SCHEMA = {
@@ -1763,11 +2290,17 @@ def _format_option_markdown(option: dict, index: int | None = None) -> list[str]
     if option.get("rating_text"):
         header += f" — {option['rating_text']}"
     lines = [header]
+    if option.get("location_text"):
+        lines.append(f"- 📍 {option['location_text']}")
     details = []
     if option.get("price_level"):
         details.append(f"Price: {option['price_level']}")
     if option.get("parking"):
         details.append(f"Parking: {option['parking']}")
+    if option.get("restroom"):
+        details.append(f"Restroom: {option['restroom']}")
+    if option.get("phone"):
+        details.append(f"Phone: {option['phone']}")
     if option.get("hours_status"):
         details.append(f"Hours: {option['hours_status']}")
     if details:
@@ -1791,11 +2324,17 @@ def _format_option_plain(option: dict) -> str:
     name = option.get("name", "Unknown")
     header = name + (f" — {option['rating_text']}" if option.get("rating_text") else "")
     lines = [header]
+    if option.get("location_text"):
+        lines.append(f"📍 {option['location_text']}")
     details = []
     if option.get("price_level"):
         details.append(f"Price: {option['price_level']}")
     if option.get("parking"):
         details.append(f"Parking: {option['parking']}")
+    if option.get("restroom"):
+        details.append(f"Restroom: {option['restroom']}")
+    if option.get("phone"):
+        details.append(f"Phone: {option['phone']}")
     if option.get("hours_status"):
         details.append(f"Hours: {option['hours_status']}")
     if details:
@@ -1867,6 +2406,11 @@ def render_structured_response(data: dict) -> str:
             emoji = note.get("emoji", "💡")
             lines.append(f"**{emoji} {title}:** {note.get('text', '')}")
             lines.append("")
+
+    lines.append("### 🆘 Emergency Numbers")
+    for number, label in EMERGENCY_NUMBERS:
+        lines.append(f"- **{number}** — {label}")
+    lines.append("")
 
     for category in plan.get("stop_categories") or []:
         lines.append(f"### {category.get('emoji', '')} {category.get('title', '')}".strip())
@@ -2081,6 +2625,13 @@ def render_plan_cards(plan: dict):
         for note in notes:
             st.markdown(f"**{note.get('emoji', '💡')} {note.get('title', '')}:** {note.get('text', '')}")
 
+    # Fixed, code-rendered, not model-generated -- see EMERGENCY_NUMBERS above for why this
+    # deliberately bypasses the AI/schema entirely rather than trusting a prompt instruction.
+    st.markdown(
+        "### 🆘 Emergency Numbers\n" +
+        "\n".join(f"- **{number}** — {label}" for number, label in EMERGENCY_NUMBERS)
+    )
+
     for category in plan.get("stop_categories") or []:
         st.markdown(f"### {category.get('emoji', '')} {category.get('title', '')}".strip())
         for i, option in enumerate(category.get("options") or [], start=1):
@@ -2153,6 +2704,73 @@ st.markdown(
     '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
     '<link href="https://fonts.googleapis.com/css2?family=Karla:ital,wght@0,400;0,500;0,700;1,400'
     '&family=Saira+Condensed:wght@500;600;700&display=swap" rel="stylesheet">',
+    unsafe_allow_html=True,
+)
+
+# Extends The Strip's own ink/paper/accent palette (see _STRIP_CSS above) across the rest of the
+# page, rather than leaving everything outside the Strip visualization itself on Streamlit's stock
+# default theme -- same tokens, same light/dark split, so the Strip no longer looks like a
+# differently-designed component dropped into an otherwise generic app. Targets real data-testid
+# selectors confirmed against this Streamlit build (1.62.0) rather than guessed class names, since
+# those are the one thing that's stayed stable across Streamlit versions when internal class names
+# haven't. Doesn't reach the Copy/Print buttons or the WhatsApp/Google-Maps buttons -- the first two
+# are restyled at their own call sites since they render inside an <iframe> (a separate document,
+# outside this page-level stylesheet's reach); the brand-colored ones are left alone on purpose,
+# same reasoning as DESIGN.md gives for keeping WhatsApp green / Google blue where they link out to
+# those actual products.
+st.markdown(
+    """<style>
+    :root {
+        --ink: #1a1a1a; --paper: #f5f4f0; --paper-raised: #ffffff;
+        --line: #b8b6ae; --mute: #75726a; --accent: #b3502c;
+    }
+    @media (prefers-color-scheme: dark) {
+        :root {
+            --ink: #ece9e2; --paper: #1c1b18; --paper-raised: #262521;
+            --line: #45433c; --mute: #a29d90; --accent: #e08a5c;
+        }
+    }
+
+    body, [data-testid="stAppViewContainer"], [data-testid="stMain"], [data-testid="stHeader"],
+    [data-testid="stSidebar"], [data-testid="stBottomBlockContainer"] {
+        background: var(--paper) !important; color: var(--ink);
+    }
+    [data-testid="stHeader"] { border-bottom: 1px solid var(--line); }
+    [data-testid="stSidebar"] { border-right: 1px solid var(--line); }
+
+    [data-testid="stHeading"] h1, [data-testid="stHeading"] h2, [data-testid="stHeading"] h3,
+    [data-testid="stMarkdown"] p, [data-testid="stMarkdown"] li, [data-testid="stWidgetLabel"] p {
+        color: var(--ink) !important;
+    }
+    [data-testid="stCaptionContainer"] { color: var(--mute) !important; }
+    a, a:visited { color: var(--accent); }
+
+    [data-testid^="stBaseButton"] {
+        background: var(--paper-raised) !important; color: var(--ink) !important;
+        border: 1px solid var(--line) !important; border-radius: 6px !important;
+    }
+    [data-testid^="stBaseButton"]:hover {
+        border-color: var(--accent) !important; color: var(--accent) !important;
+    }
+
+    [data-testid="stTextInputField"], [data-testid="stTextAreaRootElement"] textarea,
+    [data-testid="stDateInputField"], [data-testid="stSelectbox"] > div > div,
+    [data-baseweb="select"] > div {
+        background: var(--paper-raised) !important; color: var(--ink) !important;
+        border-color: var(--line) !important;
+    }
+    [data-testid="stTextInputField"]:focus, [data-testid="stTextAreaRootElement"] textarea:focus {
+        border-color: var(--accent) !important;
+        box-shadow: 0 0 0 1px var(--accent) !important;
+    }
+
+    [data-testid="stCheckbox"] input { accent-color: var(--accent); }
+    [data-testid="stFeedbackButton"] { color: var(--mute) !important; }
+    [data-testid="stFeedbackButton"][aria-checked="true"] { color: var(--accent) !important; }
+
+    hr, [data-testid="stDivider"] { border-color: var(--line) !important; }
+    [data-testid="stStatusWidget"] { background: var(--paper-raised) !important; border-color: var(--line) !important; }
+    </style>""",
     unsafe_allow_html=True,
 )
 
@@ -2421,6 +3039,22 @@ if st.session_state.get('planning_triggered', False):
         "together in its categories list (e.g. ['vegetarian restaurant', 'clean public restroom', 'petrol pump']) "
         "instead of calling it separately per category -- each call is a slow round trip through your own "
         "reasoning, so batching every category into one call is what keeps the plan fast. "
+        "Base Category Rubric -- ALWAYS include these four in that same categories list, regardless of what the "
+        "user explicitly asked for, on top of anything else the trip specifically needs (e.g. a pharmacy, an "
+        "ATM, a grocery stop): "
+        "1) a food/restaurant query, phrased for any stated dietary preference (e.g. 'pure vegetarian "
+        "restaurant' if the user wants veg, a plain 'restaurant' otherwise); "
+        "2) a fuel/petrol station query ('petrol pump' or 'fuel station'); "
+        "3) a hospital/emergency-care query ('hospital' or 'multispecialty hospital') -- present these under "
+        "their own stop_categories entry (e.g. '🏥 Hospitals / Emergency Care'), and for every option here set "
+        "the 'phone' field from get_place_details_and_reviews's 'phone' -- a hospital listing with no way to "
+        "call it isn't actually useful in an emergency; "
+        "4) a tea/snacks query ('tea stall snacks shop' or 'cafe') for a quick break distinct from a full meal. "
+        "This exists because a plan that only covers what the user thought to ask for has exactly the kind of "
+        "gap this app exists to close -- nobody remembers to ask 'are there hospitals nearby' until they "
+        "actually need one. Skip a base category only for a genuinely short trip where it plainly doesn't "
+        "apply (e.g. hospital search for a 15-minute in-city errand), and say so briefly in intro_text rather "
+        "than silently dropping it without explanation. "
         "Call get_place_details_and_reviews exactly once, passing the place_ids of every candidate place "
         "you want details for together in one list, instead of calling it separately per place. "
         "Every option that came from a real tool result has a real place_id from that tool response -- always "
@@ -2441,6 +3075,25 @@ if st.session_state.get('planning_triggered', False):
         "for that place -- a genuinely balanced take shows the downside too, not just the best quote available; "
         "leave it null only when critical_review was actually null (nothing <=3 stars in what Google returned), "
         "never omit it just because it makes the option look worse. "
+        "Also set 'location_text' for every option from search_places_along_route's 'vicinity' field, and fold "
+        "in that same result's 'distance_from_origin_km' as a natural phrase -- e.g. 'NH44, Thandavapura, "
+        "Karnataka -- about 75 km into the trip' or 'Magadi Road, Bengaluru -- right at departure, before you "
+        "leave'. A name alone doesn't tell the user whether a stop is actually along the highway ahead of them "
+        "or just near where they're starting from -- this is what makes that honest at a glance instead of "
+        "something they have to infer or that gets buried only in the verdict text. "
+        "Also set 'restroom' for every option from get_place_details_and_reviews's 'restroom_available' text, "
+        "copied verbatim -- this is Google's own confirmed signal for that specific place, not a guess. Never "
+        "state or imply that a place has a restroom because of its category, cuisine, chain, or because a "
+        "separate restroom search ran elsewhere on the route -- a claim like 'we picked restaurants with clean "
+        "restrooms' describing a whole list of options, when only some or none of the individual places actually "
+        "confirmed it, is exactly the kind of generic, unverified claim this app exists to avoid. If "
+        "restroom_available says Google hasn't confirmed one, say so plainly rather than staying silent about it "
+        "or letting the reader assume it's covered. "
+        "When search_places_along_route's 'recognized_chain' is non-null for an option, you may note in the "
+        "verdict that it's a recognized chain with generally consistent standards across locations -- this is "
+        "tone/confidence context only, from a name match, never a substitute for a real per-place fact. Do not "
+        "use it to state or imply restroom availability, hours, or anything else that has its own real field -- "
+        "when those fields say 'not confirmed,' say 'not confirmed,' even for a recognized chain. "
         "The following Trip Stop Rubric applies specifically when evaluating FOOD stops (skip it for "
         "non-food stops like shops, fuel, or pharmacies, and instead just note hours, ratings, and anything "
         "relevant from reviews): explicitly state if it's 'Pure Veg', 'Veg & Non-Veg', or 'Fast Food/Chains'; "
@@ -2453,10 +3106,16 @@ if st.session_state.get('planning_triggered', False):
         "and volunteer relevant suggestions even when the user didn't explicitly ask for them -- put these in "
         "'proactive_notes' entries (separate from the options/categories the user actually asked for) so they "
         "don't crowd out what was actually asked: "
-        "- Compare the departure time and ETAs against typical Indian meal windows (breakfast ~7-10am, lunch "
-        "~12:30-3pm, dinner ~7:30-10:30pm). If the journey overlaps one, proactively suggest a food stop timed to "
-        "that point even if the user only asked for something else like fuel or snacks -- people traveling around "
-        "mealtimes usually want to eat too. "
+        "- Compare each stop's real arrival time -- from calculate_route_and_etas's 'waypoints' "
+        "(estimated_arrival_iso, traffic-aware), matched to that stop by nearest km_from_origin, not "
+        "a proportional guess from total trip duration -- against typical Indian meal windows "
+        "(breakfast ~7-10am, lunch ~12:30-3pm, dinner ~7:30-10:30pm). If the journey overlaps one, "
+        "proactively suggest a food stop timed to that point even if the user only asked for "
+        "something else like fuel or snacks -- people traveling around mealtimes usually want to eat "
+        "too. Traffic can shift a stop's real arrival time well outside what a flat proportional "
+        "estimate would show (a stop that 'looks like' lunchtime by simple math can, with traffic, "
+        "actually be reached mid-afternoon) -- use the real waypoint time, not the simple math, for "
+        "every itinerary_timeline entry and every meal-window judgment. "
         "- Include a query like 'clean public restroom' or 'rest area' in the categories you pass to "
         "search_places_along_route -- and include a distinct stop_categories entry (title like '🚻 Restroom "
         "Stops') with real results from it -- only when "
@@ -2545,17 +3204,51 @@ if st.session_state.get('planning_triggered', False):
         st.session_state._places_api_stats = {}
         st.session_state._routes_api_stats = {}
         start = time.monotonic()
-        response = chat.send_message(prompt)
-        duration_s = time.monotonic() - start
-        status.update(label=f"✅ Plan ready in {duration_s:.1f}s", state="complete")
-        content, response_meta = response_to_markdown(response.text)
-        log_usage_event("plan", st.session_state.origin, st.session_state.destination,
-                         st.session_state.preferences, duration_s, st.session_state._tool_trace, response_meta,
-                         st.session_state._places_api_stats, st.session_state._routes_api_stats)
-        st.session_state._progress_status = None
-        st.session_state.chat_messages.append({"role": "assistant", "content": content})
-        if response_meta.get("structured_ok") and response_meta.get("response_type") == "plan":
-            st.session_state.latest_plan_message_index = len(st.session_state.chat_messages) - 1
+        try:
+            # response.text (not just chat.send_message itself) is deliberately inside this try:
+            # the genai SDK raises ValueError from .text when a response has no valid text part --
+            # e.g. a safety-blocked turn, or the AFC loop exhausting maximum_remote_calls mid-plan
+            # and leaving an unresolved function_call with no text turn (see the comment on
+            # maximum_remote_calls above). A tool function raising (e.g. a malformed Maps API
+            # response triggering a KeyError inside calculate_route_and_etas) also surfaces here,
+            # since AFC calls tool functions synchronously as part of this one blocking call.
+            response = chat.send_message(prompt)
+            content, response_meta = response_to_markdown(response.text)
+        except Exception as exc:
+            # Deliberately broad, unlike the narrow, specific exception handling used elsewhere in
+            # this file (e.g. _api_request's 5xx-only retry) -- this is the single outermost
+            # boundary of the whole planning request, so anything that reaches here, regardless of
+            # its real cause (Gemini API error, a tool function bug, a malformed API response one of
+            # the tools didn't guard against), should degrade to a clear retry message rather than
+            # crash the whole Streamlit script. Observed directly in production: an uncaught
+            # google.genai.errors.ServerError here did exactly that, showing the user a raw
+            # traceback page -- exactly the kind of ungraceful failure this app is supposed to avoid
+            # (see ARCHITECTURE.md's "no fallback to the model's own knowledge" row for the same
+            # philosophy at a different failure point). The genai SDK already retries transient
+            # failures internally (tenacity) before raising, so retrying immediately here wouldn't
+            # help -- degrade instead.
+            duration_s = time.monotonic() - start
+            status.update(label="⚠️ Planning hit an error", state="error")
+            st.session_state._progress_status = None
+            log_usage_event("plan", st.session_state.origin, st.session_state.destination,
+                             st.session_state.preferences, duration_s, st.session_state._tool_trace,
+                             {"structured_ok": False, "response_type": "error"},
+                             st.session_state._places_api_stats, st.session_state._routes_api_stats)
+            logger.exception("chat.send_message failed while planning")
+            st.error(
+                "The trip planner hit a temporary error talking to Gemini. This usually clears up "
+                "on its own -- please click 'Plan My Trip' again in a moment."
+            )
+        else:
+            duration_s = time.monotonic() - start
+            status.update(label=f"✅ Plan ready in {duration_s:.1f}s", state="complete")
+            log_usage_event("plan", st.session_state.origin, st.session_state.destination,
+                             st.session_state.preferences, duration_s, st.session_state._tool_trace, response_meta,
+                             st.session_state._places_api_stats, st.session_state._routes_api_stats)
+            st.session_state._progress_status = None
+            st.session_state.chat_messages.append({"role": "assistant", "content": content})
+            if response_meta.get("structured_ok") and response_meta.get("response_type") == "plan":
+                st.session_state.latest_plan_message_index = len(st.session_state.chat_messages) - 1
 
     st.subheader("Your Personalized Journey Plan")
     for i, message in enumerate(st.session_state.chat_messages):
@@ -2585,18 +3278,37 @@ if st.session_state.get('planning_triggered', False):
         st.session_state._places_api_stats = {}
         st.session_state._routes_api_stats = {}
         start = time.monotonic()
-        response = chat.send_message(followup)
-        duration_s = time.monotonic() - start
-        status.update(label=f"✅ Answered in {duration_s:.1f}s", state="complete")
-        content, response_meta = response_to_markdown(response.text)
-        log_usage_event("followup", st.session_state.origin, st.session_state.destination,
-                         followup, duration_s, st.session_state._tool_trace, response_meta,
-                         st.session_state._places_api_stats, st.session_state._routes_api_stats)
-        st.session_state._progress_status = None
-        st.session_state.chat_messages.append({"role": "assistant", "content": content})
-        if response_meta.get("structured_ok") and response_meta.get("response_type") == "plan":
-            st.session_state.latest_plan_message_index = len(st.session_state.chat_messages) - 1
-        st.rerun()
+        try:
+            # See the matching comment on the initial-plan call above: response.text and the tool
+            # functions AFC calls along the way can all raise here, not just chat.send_message
+            # itself, so both the call and the .text access belong inside this same try.
+            response = chat.send_message(followup)
+            content, response_meta = response_to_markdown(response.text)
+        except Exception as exc:
+            # Deliberately broad -- see the matching comment on the initial-plan call above.
+            duration_s = time.monotonic() - start
+            status.update(label="⚠️ That follow-up hit an error", state="error")
+            st.session_state._progress_status = None
+            log_usage_event("followup", st.session_state.origin, st.session_state.destination,
+                             followup, duration_s, st.session_state._tool_trace,
+                             {"structured_ok": False, "response_type": "error"},
+                             st.session_state._places_api_stats, st.session_state._routes_api_stats)
+            logger.exception("chat.send_message failed on a follow-up")
+            st.error(
+                "That follow-up hit a temporary error talking to Gemini. This usually clears up on "
+                "its own -- please try asking again in a moment."
+            )
+        else:
+            duration_s = time.monotonic() - start
+            status.update(label=f"✅ Answered in {duration_s:.1f}s", state="complete")
+            log_usage_event("followup", st.session_state.origin, st.session_state.destination,
+                             followup, duration_s, st.session_state._tool_trace, response_meta,
+                             st.session_state._places_api_stats, st.session_state._routes_api_stats)
+            st.session_state._progress_status = None
+            st.session_state.chat_messages.append({"role": "assistant", "content": content})
+            if response_meta.get("structured_ok") and response_meta.get("response_type") == "plan":
+                st.session_state.latest_plan_message_index = len(st.session_state.chat_messages) - 1
+            st.rerun()
 
 # Always at the very end of the page, regardless of whether a trip has been planned yet -- someone
 # might want to say "the search box is confusing" without ever getting as far as a plan.

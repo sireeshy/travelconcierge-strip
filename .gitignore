@@ -5,3 +5,4 @@ __pycache__/
 *.log
 usage_log.csv
 feedback_log.csv
+_streamlit_secrets_to_paste.toml
