@@ -450,6 +450,222 @@ def _api_request(method: str, url: str, *, headers: dict | None = None, json_bod
     return response
 
 
+# Curated toll-plaza database for corridors this app has actually been tested on -- NOT exhaustive
+# nationwide coverage. Built after Google's Routes API TOLLS extraComputation was verified (against
+# NHAI-sourced third-party toll calculators) to overestimate by ~2.7x on a real route: Hyderabad<->
+# Bengaluru came back Rs 1950 from Google, Rs 715 from NHAI-sourced calculators, cross-checked
+# against two independent sources. Data below is sourced the same way (NHAI-backed calculators),
+# then geocoded via Places API to real coordinates so plazas can be matched against a route's
+# actual polyline instead of trusted from Google's own (demonstrably unreliable, for Indian tolls)
+# estimate.
+#
+# Coverage is intentionally bounded, not automated -- an unmaintained "cover everything" table goes
+# stale exactly as fast as a small one, just less visibly. REVISE THIS TABLE EVERY 6 MONTHS (next
+# due ~2027-02) -- NHAI toll rates change periodically (WPI-linked revisions); data below gathered
+# 2026-08. Routes outside this table's coverage fall back to a live lookup, then to Google's
+# estimate with an explicit "unverified" caveat -- see _toll_for_route below.
+TOLL_PLAZAS = [
+    # NH44, Hyderabad <-> Bengaluru corridor
+    {"name": "Marur", "lat": 14.5020692, "lng": 77.6312836, "car_inr": 145, "highway": "NH44"},
+    {"name": "Kasepalli", "lat": 15.0617571, "lng": 77.6303444, "car_inr": 130, "highway": "NH44"},
+    {"name": "Amakathadu", "lat": 15.4865638, "lng": 77.9011596, "car_inr": 140, "highway": "NH44"},
+    {"name": "Pullur", "lat": 15.88775, "lng": 78.0169762, "car_inr": 145, "highway": "NH44"},
+    {"name": "Shakapur", "lat": 16.5356813, "lng": 77.944372, "car_inr": 75, "highway": "NH44"},
+    {"name": "Raikal", "lat": 17.0059277, "lng": 78.194337, "car_inr": 80, "highway": "NH44"},
+    # NH44, Hyderabad -> Nagpur corridor
+    {"name": "Manoharabad", "lat": 17.8010886, "lng": 78.471757, "car_inr": 90, "highway": "NH44"},
+    {"name": "Indalwai", "lat": 18.5383087, "lng": 78.2396172, "car_inr": 85, "highway": "NH44"},
+    {"name": "Pippalwada", "lat": 19.7809141, "lng": 78.5657746, "car_inr": 95, "highway": "NH44"},
+    {"name": "Kelapur", "lat": 20.0193237, "lng": 78.5402198, "car_inr": 105, "highway": "NH44"},
+    {"name": "Daroda", "lat": 20.4506267, "lng": 78.7552876, "car_inr": 115, "highway": "NH44"},
+    {"name": "Borkhedi (Nagpur bypass)", "lat": 20.8560864, "lng": 78.9636019, "car_inr": 150, "highway": "NH44"},
+    # NH275, Bengaluru <-> Mysuru/Ooty corridor
+    {"name": "Kaniminike (Bidadi)", "lat": 12.8595709, "lng": 77.4311079, "car_inr": 165, "highway": "NH275"},
+    {"name": "KN Hundy", "lat": 12.2130339, "lng": 76.6629785, "car_inr": 55, "highway": "NH275"},
+]
+
+
+@st.cache_resource(show_spinner=False)
+def _get_toll_plazas_worksheet():
+    """Opens (creating if needed) a 'toll_plazas' tab inside the shared usage-log spreadsheet --
+    reuses that spreadsheet rather than asking for a whole new one, since the same service account
+    already has access to it. Persists plazas discovered by _toll_from_live_lookup below, so a
+    route researched once is reused on every later request for the same corridor instead of being
+    re-scraped and re-geocoded from scratch each time -- this is what lets TOLL_PLAZAS's effective
+    coverage grow over time without a code change/redeploy. Returns None (falls back to running the
+    live lookup fresh every time, never persisting) when credentials/USAGE_SHEET_ID aren't set or
+    the Sheet can't be reached."""
+    creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS_JSON")
+    sheet_id = os.environ.get("USAGE_SHEET_ID")
+    if not creds_json or not sheet_id:
+        return None
+    try:
+        import gspread
+        gc = gspread.service_account_from_dict(json.loads(creds_json))
+        spreadsheet = gc.open_by_key(sheet_id)
+        try:
+            sheet = spreadsheet.worksheet("toll_plazas")
+        except gspread.exceptions.WorksheetNotFound:
+            sheet = spreadsheet.add_worksheet(title="toll_plazas", rows=200, cols=6)
+            sheet.append_row(["name", "lat", "lng", "car_inr", "highway", "discovered_at"])
+        return sheet
+    except Exception:
+        logger.exception("failed to connect to the toll_plazas worksheet")
+        return None
+
+
+@st.cache_resource(show_spinner=False)
+def _get_learned_toll_plazas() -> list[dict]:
+    """Toll plazas discovered by past live lookups (see _toll_from_live_lookup), read once per
+    server process. Additive to TOLL_PLAZAS, never load-bearing: returns [] if the Sheet isn't
+    configured, can't be reached, or has a row that doesn't parse -- the live lookup just runs
+    again for that route next time rather than the app breaking."""
+    sheet = _get_toll_plazas_worksheet()
+    if sheet is None:
+        return []
+    try:
+        learned = []
+        for row in sheet.get_all_records():
+            try:
+                learned.append({
+                    "name": row["name"], "lat": float(row["lat"]), "lng": float(row["lng"]),
+                    "car_inr": int(row["car_inr"]), "highway": row.get("highway", "unknown"),
+                })
+            except (KeyError, ValueError):
+                continue
+        return learned
+    except Exception:
+        logger.exception("failed to load learned toll plazas from the Google Sheet")
+        return []
+
+
+def _persist_learned_plazas(new_plazas: list[dict]):
+    """Appends newly live-looked-up plazas to the toll_plazas Sheet, skipping any name already
+    there. Best-effort: a failure here just means this route gets re-looked-up next time, not a
+    broken plan -- never let this raise into the caller."""
+    sheet = _get_toll_plazas_worksheet()
+    if sheet is None or not new_plazas:
+        return
+    try:
+        existing_names = {row.get("name") for row in sheet.get_all_records()}
+        timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        for plaza in new_plazas:
+            if plaza["name"] in existing_names:
+                continue
+            sheet.append_row([plaza["name"], plaza["lat"], plaza["lng"], plaza["car_inr"],
+                               plaza.get("highway", "unknown"), timestamp])
+    except Exception:
+        logger.exception("failed to persist learned toll plazas")
+
+
+# tolltax.in uses older/common city names in its URLs, not always what Google's formatted address
+# returns (e.g. "bangalore", not "bengaluru") -- extend this as more mismatches are found.
+_TOLL_CITY_SLUG_ALIASES = {"bengaluru": "bangalore"}
+
+
+def _city_slug(address: str) -> str:
+    city = address.split(",")[0].strip().lower()
+    city = _TOLL_CITY_SLUG_ALIASES.get(city, city)
+    return re.sub(r"[^a-z0-9]+", "-", city).strip("-")
+
+
+def _toll_from_live_lookup(origin: str, destination: str, encoded_polyline: str,
+                            path: list[tuple[float, float]]) -> dict | None:
+    """Best-effort live toll lookup for a route not yet in TOLL_PLAZAS/_get_learned_toll_plazas,
+    scraping tolltax.in's NHAI-sourced per-route calculator (predictable URL:
+    {origin-city}-to-{destination-city}-toll-tax.php). Every plaza it names is geocoded with an
+    along-route Places search (the same searchAlongRouteParameters mechanism
+    search_places_along_route uses) rather than a blind global text search -- a plain "{name} toll
+    plaza India" text search was observed matching a same-named business nowhere near the actual
+    route (an auto-repair shop 18km off-route, for a real plaza name); constraining the search to
+    the route corridor itself fixes that at the source, and the polyline distance check below (5km)
+    stays on as defense in depth rather than the only safeguard.
+
+    Returns None on any failure (site down or restructured, no plazas found, nothing survives the
+    checks) -- this is a nice-to-have enhancement layered on top of the reliable static table, never
+    allowed to block route calculation beyond its own short timeout, and never allowed to raise into
+    the caller.
+    """
+    try:
+        url = f"https://www.tolltax.in/charges/{_city_slug(origin)}-to-{_city_slug(destination)}-toll-tax.php"
+        response = requests.get(url, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
+        if not response.ok:
+            return None
+        rows = re.findall(r"title='See all toll rates of ([^']+)'>[^<]*</td>\s*<td>(\d+)</td>", response.text)
+        candidates = [(name, int(rate)) for name, rate in rows if int(rate) > 0]
+        if not candidates:
+            return None
+
+        api_key = st.session_state.get("google_maps_api_key")
+        if not api_key:
+            return None
+        geocode_headers = {
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": api_key,
+            "X-Goog-FieldMask": "places.displayName.text,places.location",
+        }
+
+        found = []
+        for name, rate in candidates:
+            try:
+                gr = requests.post(
+                    "https://places.googleapis.com/v1/places:searchText",
+                    headers=geocode_headers,
+                    json={
+                        "textQuery": f"{name} toll",
+                        "searchAlongRouteParameters": {"polyline": {"encodedPolyline": encoded_polyline}},
+                        "pageSize": 1,
+                        "languageCode": "en-US",
+                    },
+                    timeout=5,
+                )
+            except requests.RequestException:
+                continue
+            if not gr.ok:
+                continue
+            places = gr.json().get("places", [])
+            if not places:
+                continue
+            loc = places[0].get("location", {})
+            lat, lng = loc.get("latitude"), loc.get("longitude")
+            if lat is None or lng is None:
+                continue
+            if min(_haversine_km(plat, plng, lat, lng) for plat, plng in path) > 5.0:
+                continue
+            found.append({"name": name, "lat": lat, "lng": lng, "car_inr": rate, "highway": "unknown"})
+
+        if not found:
+            return None
+        return {"total_inr": sum(p["car_inr"] for p in found), "plazas": [p["name"] for p in found],
+                "new_plazas": found}
+    except Exception:
+        logger.exception("live toll lookup failed for %r -> %r", origin, destination)
+        return None
+
+
+def _toll_for_route(path: list[tuple[float, float]]) -> dict | None:
+    """Sums known toll-plaza rates for plazas the route polyline actually passes near (within 2km
+    -- toll plazas sit directly on the highway, so a route using that highway passes very close to
+    the plaza's own coordinates, and 2km comfortably covers real-world geocoding slop without
+    picking up a plaza on a genuinely different nearby road). Checks both the hand-curated
+    TOLL_PLAZAS table and plazas learned from past live lookups.
+
+    Returns None (not zero) when no known plaza matches -- that means this route isn't in
+    TOLL_PLAZAS's coverage yet, not that the route is toll-free. Callers should fall back to a
+    live lookup or Google's (caveated) estimate rather than claim Rs 0.
+    """
+    if not path:
+        return None
+    all_plazas = TOLL_PLAZAS + _get_learned_toll_plazas()
+    matched = [
+        plaza for plaza in all_plazas
+        if min(_haversine_km(lat, lng, plaza["lat"], plaza["lng"]) for lat, lng in path) <= 2.0
+    ]
+    if not matched:
+        return None
+    return {"total_inr": sum(p["car_inr"] for p in matched), "plazas": [p["name"] for p in matched]}
+
+
 @timed_tool
 def calculate_route_and_etas(origin: str, destination: str, departure_time_iso: str) -> dict:
     """
@@ -555,7 +771,7 @@ def calculate_route_and_etas(origin: str, destination: str, departure_time_iso: 
     stats[source] = stats.get(source, 0) + 1
 
     if not routes_data.get('routes'):
-        return {"total_duration_seconds": 0, "total_distance_meters": 0, "legs": [], "encoded_overall_polyline": ""}
+        return {"total_duration_seconds": 0, "total_distance_meters": 0, "legs": []}
 
     route = routes_data['routes'][0]
     legs = []
@@ -569,31 +785,66 @@ def calculate_route_and_etas(origin: str, destination: str, departure_time_iso: 
             # so the function's own params are a safe stand-in for the address strings.
             "end_address": destination,
             "start_address": origin,
-            "encoded_polyline": leg_data['polyline']['encodedPolyline']
         })
 
+    # Show both numbers side by side rather than silently picking one -- verified directly against
+    # the live API that they can disagree a lot: Google's Routes API TOLLS extraComputation
+    # returned Rs 1950 for Hyderabad<->Bengaluru against NHAI-sourced calculators' Rs 715, a ~2.7x
+    # overestimate. Concierge Estimate is our own curated, NHAI-sourced toll-plaza data
+    # (TOLL_PLAZAS above), present only for the corridors it covers; Google Estimate is always
+    # included when Google returns one, labeled as Google's own figure so neither is passed off as
+    # the other.
+    route_path = decode_polyline(route['polyline']['encodedPolyline'])
+    known_toll = _toll_for_route(route_path)
+    if not known_toll:
+        # No corridor match in TOLL_PLAZAS or what's been learned so far -- try a live lookup
+        # before falling back to Google's estimate. Successful discoveries get persisted (see
+        # _persist_learned_plazas) so this exact corridor doesn't need re-discovering next time.
+        live_toll = _toll_from_live_lookup(origin, destination, route['polyline']['encodedPolyline'], route_path)
+        if live_toll:
+            known_toll = {"total_inr": live_toll["total_inr"], "plazas": live_toll["plazas"]}
+            _persist_learned_plazas(live_toll["new_plazas"])
+
     toll_prices = route.get('travelAdvisory', {}).get('tollInfo', {}).get('estimatedPrice', [])
-    estimated_toll = None
+    google_toll = None
     if toll_prices:
         price = toll_prices[0]
-        estimated_toll = f"{price.get('units', '0')}.{price.get('nanos', 0) // 10_000_000:02d} {price.get('currencyCode', '')}".strip()
+        google_toll = f"{price.get('units', '0')}.{price.get('nanos', 0) // 10_000_000:02d} {price.get('currencyCode', '')}".strip()
 
-    # Not sent to the model -- stashed for the UI to draw the route on a map.
+    toll_parts = []
+    if known_toll:
+        toll_parts.append(f"Concierge Estimate: Rs {known_toll['total_inr']} "
+                           f"(verified against known toll plazas: {', '.join(known_toll['plazas'])})")
+    if google_toll:
+        toll_parts.append(f"Google Estimate: {google_toll}")
+    estimated_toll = " | ".join(toll_parts) if toll_parts else None
+
+    # Stashed for the UI (route map) and for search_places_along_route to read directly, rather
+    # than sent to the model as a return value -- see search_places_along_route's docstring for why
+    # (the model corrupting this ~8-9KB opaque string when passing it back as an argument).
     st.session_state.route_polyline = route['polyline']['encodedPolyline']
 
     return {
         "total_duration_seconds": int(route['duration'].replace('s', '')),
         "total_distance_meters": route['distanceMeters'],
         "legs": legs,
-        "encoded_overall_polyline": route['polyline']['encodedPolyline'],
         "estimated_toll_cost": estimated_toll
     }
 
 
 @timed_tool
-def search_places_along_route(encoded_polyline: str, categories: list[str]) -> dict:
+def search_places_along_route(categories: list[str]) -> dict:
     """
-    Searches for places along an encoded polyline route matching one or more free-text queries.
+    Searches for places along the current route matching one or more free-text queries. Uses the
+    route from the most recent calculate_route_and_etas call -- call that first.
+
+    There is no 'encoded_polyline' parameter on purpose: an earlier version had the model pass the
+    route polyline as an argument, and it was observed corrupting the ~8-9KB opaque string in
+    transit -- a model regenerates a function-call argument token by token rather than copying it
+    verbatim, and periodically produced a string Places API (New) rejected with "Search Along Route
+    requires a valid and non-empty polyline" on an otherwise-valid request. Reading it from
+    st.session_state (stashed by calculate_route_and_etas as a side effect) instead of asking the
+    model to carry data it doesn't need to reason about removes that failure mode at the source.
 
     'categories' has no default value on purpose: it used to be a single "category" string that
     defaulted to "restaurant", which meant the model would silently fall back to restaurant
@@ -617,6 +868,10 @@ def search_places_along_route(encoded_polyline: str, categories: list[str]) -> d
     per requested category, each independently either a places list or an error, so one bad/empty
     category never blocks the results for the others.
     """
+    encoded_polyline = st.session_state.get('route_polyline')
+    if not encoded_polyline:
+        return {"error": "No route has been calculated yet -- call calculate_route_and_etas first."}
+
     api_key = st.session_state.get("google_maps_api_key")
     if not api_key:
         return {"error": "GOOGLE_MAPS_API_KEY is not configured on the server."}
@@ -2173,7 +2428,10 @@ if st.session_state.get('planning_triggered', False):
         "and the 'view on Google Maps' link for that exact business, so leaving it out or inventing one breaks "
         "those -- omit the field entirely only for an option that didn't come from a tool result at all. "
         "Fill 'itinerary_timeline' with departure and every stop's arrival time, and set 'toll_cost_text' in "
-        "'trip_overview' if calculate_route_and_etas returned an estimate. "
+        "'trip_overview' from calculate_route_and_etas's estimated_toll_cost. When it contains both a "
+        "'Concierge Estimate' and a 'Google Estimate', present both labeled exactly that way (e.g. 'Concierge "
+        "Estimate: Rs 715 | Google Estimate: Rs 1950') rather than picking one -- they can disagree "
+        "significantly, and the user should see both rather than have one silently chosen for them. "
         "Use emojis (🟢 Good, 🟡 Moderate, ⚠️ Red Flag) inside field text for quick-scan ratings where it helps. "
         "Provide actual ratings and review snippets in the relevant option fields. For every option, also set "
         "'review_recency' from get_place_details_and_reviews's most_recent_review.relative_time -- a 4.5-star "
