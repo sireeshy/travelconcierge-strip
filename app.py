@@ -7,11 +7,13 @@ from datetime import datetime, timedelta, timezone
 from dateutil import parser
 from timezonefinder import TimezoneFinder
 from zoneinfo import ZoneInfo
+from concurrent.futures import ThreadPoolExecutor
 import base64
 import csv
 import functools
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -25,6 +27,11 @@ dotenv.load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("journey_concierge")
 
+# Both app variants (this one and the original layout) write usage and feedback into the same
+# shared Sheets (see HANDOFF.md) so every row is tagged with which one it came from -- otherwise
+# "which layout gets used more, and rated better" is unanswerable.
+APP_VERSION = "strip"
+
 # CSV lives next to app.py, not in the repo (gitignored) -- structured per-request timing data for
 # local analysis. Note this resets on every Streamlit Community Cloud restart/redeploy since its
 # filesystem is ephemeral; treat it as a local-dev tool, not a durable analytics store.
@@ -32,53 +39,168 @@ USAGE_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "usage
 
 
 USAGE_LOG_HEADER = [
-    "timestamp_utc", "event", "origin", "destination", "preferences", "duration_s",
+    "timestamp_utc", "version", "event", "origin", "destination", "preferences", "duration_s",
     "tool_calls", "tool_errors", "structured_ok", "response_type",
+    "places_api_new", "places_api_legacy", "places_api_failed",
+    "routes_api_new", "routes_api_legacy", "routes_api_failed",
 ]
 
 
+@st.cache_resource(show_spinner=False)
+def _get_usage_worksheet():
+    """Opens the shared usage-log Google Sheet via a service account, if one is configured -- same
+    pattern as _get_feedback_worksheet below. usage_log.csv resets on every Streamlit Community Cloud
+    restart/redeploy (ephemeral filesystem), so it can't answer "when and whether people actually use
+    this" on its own; this Sheet is the durable copy. Returns None (falls back to local-only logging)
+    when GOOGLE_SHEETS_CREDENTIALS_JSON / USAGE_SHEET_ID aren't set, or the Sheet can't be reached."""
+    creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS_JSON")
+    sheet_id = os.environ.get("USAGE_SHEET_ID")
+    if not creds_json or not sheet_id:
+        return None
+    try:
+        import gspread
+        gc = gspread.service_account_from_dict(json.loads(creds_json))
+        sheet = gc.open_by_key(sheet_id).sheet1
+        if not sheet.row_values(1):
+            sheet.append_row(USAGE_LOG_HEADER)
+        return sheet
+    except Exception:
+        logger.exception("failed to connect to the usage Google Sheet")
+        return None
+
+
 def log_usage_event(event_type: str, origin: str, destination: str, preferences: str, duration_s: float,
-                     tool_trace: list[dict], response_meta: dict):
+                     tool_trace: list[dict], response_meta: dict, places_api_stats: dict | None = None,
+                     routes_api_stats: dict | None = None):
     """Appends one row per user-facing request (initial plan or follow-up) to usage_log.csv, and
     mirrors a summary line to stdout. tool_trace is the list of {name, detail, duration_s, ok}
     dicts collected by @timed_tool during this request. response_meta is the {structured_ok,
-    response_type} dict from response_to_markdown.
+    response_type} dict from response_to_markdown. places_api_stats / routes_api_stats are the
+    {'new', 'legacy', 'failed'} counter dicts accumulated in st.session_state['_places_api_stats']
+    / ['_routes_api_stats'] by the Places/Routes tool functions this request (empty/None if a tool
+    didn't run, e.g. a follow-up that didn't need a fresh lookup).
 
-    Beyond timing, this is the performance signal for two things that can silently degrade without
-    anyone noticing in a chat UI: tool_errors catches Maps/Places API failures (see the transient
-    search_places_along_route error noted in HANDOFF.md), and structured_ok catches the
+    Beyond timing, this is the performance signal for things that can silently degrade without
+    anyone noticing in a chat UI: tool_errors catches a Gemini tool call that ultimately failed;
+    places_api_*/routes_api_* break that down further, one row per underlying Maps/Places API call
+    (a single search_places_along_route call can cover several categories, each independently
+    served by the new API, the legacy fallback, or neither) -- this is what actually answers "what's
+    our failure rate" and "how often is a legacy fallback needed" as trackable numbers instead of
+    something only visible by reading server logs one incident at a time. structured_ok catches the
     structured-output-plus-tools combo (a preview feature as of this writing, see the comment above
-    CONCIERGE_RESPONSE_SCHEMA) silently reverting to unparsed text. Both are invisible to a user who
-    just sees *a* plan and has no earlier run to compare against.
+    CONCIERGE_RESPONSE_SCHEMA) silently reverting to unparsed text. All of this is invisible to a
+    user who just sees *a* plan and has no earlier run to compare against.
     """
     tool_summary = "; ".join(f"{t['name']}{t['detail']}({t['duration_s']:.1f}s)" for t in tool_trace)
     tool_errors = sum(1 for t in tool_trace if not t.get("ok", True))
+    places_api_stats = places_api_stats or {}
+    routes_api_stats = routes_api_stats or {}
     logger.info(
         "usage event=%s origin=%r destination=%r duration_s=%.2f tool_calls=%d tool_errors=%d "
-        "structured_ok=%s response_type=%s [%s]",
+        "places_api_new=%d places_api_legacy=%d places_api_failed=%d "
+        "routes_api_new=%d routes_api_legacy=%d routes_api_failed=%d structured_ok=%s response_type=%s [%s]",
         event_type, origin, destination, duration_s, len(tool_trace), tool_errors,
+        places_api_stats.get('new', 0), places_api_stats.get('legacy', 0), places_api_stats.get('failed', 0),
+        routes_api_stats.get('new', 0), routes_api_stats.get('legacy', 0), routes_api_stats.get('failed', 0),
         response_meta.get("structured_ok"), response_meta.get("response_type"), tool_summary,
     )
+    row = [
+        datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        APP_VERSION,
+        event_type,
+        origin,
+        destination,
+        preferences.replace("\n", " ")[:200],
+        f"{duration_s:.2f}",
+        tool_summary,
+        tool_errors,
+        response_meta.get("structured_ok"),
+        response_meta.get("response_type"),
+        places_api_stats.get('new', 0),
+        places_api_stats.get('legacy', 0),
+        places_api_stats.get('failed', 0),
+        routes_api_stats.get('new', 0),
+        routes_api_stats.get('legacy', 0),
+        routes_api_stats.get('failed', 0),
+    ]
     try:
         file_exists = os.path.exists(USAGE_LOG_PATH)
         with open(USAGE_LOG_PATH, "a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             if not file_exists:
                 writer.writerow(USAGE_LOG_HEADER)
-            writer.writerow([
-                datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                event_type,
-                origin,
-                destination,
-                preferences.replace("\n", " ")[:200],
-                f"{duration_s:.2f}",
-                tool_summary,
-                tool_errors,
-                response_meta.get("structured_ok"),
-                response_meta.get("response_type"),
-            ])
+            writer.writerow(row)
     except Exception:
         logger.exception("failed to write usage_log.csv")
+
+    sheet = _get_usage_worksheet()
+    if sheet is not None:
+        try:
+            sheet.append_row(row)
+        except Exception:
+            logger.exception("failed to append usage event to the Google Sheet")
+
+
+FEEDBACK_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feedback_log.csv")
+FEEDBACK_LOG_HEADER = ["timestamp_utc", "version", "rating", "comment", "origin", "destination"]
+
+
+@st.cache_resource(show_spinner=False)
+def _get_feedback_worksheet():
+    """Opens the shared feedback Google Sheet via a service account, if one is configured.
+    st.cache_resource (not cache_data) because this holds a live API client connection, not
+    serializable data -- built once per server process, not per user session.
+
+    Returns None -- and log_feedback() below falls back to local-only logging -- when
+    GOOGLE_SHEETS_CREDENTIALS_JSON / FEEDBACK_SHEET_ID aren't set, or the Sheet can't be reached
+    (wrong ID, not shared with the service account, API not enabled, etc). Feedback should never be
+    silently lost or block the submit button just because the Sheet integration isn't set up yet or
+    has a transient problem -- see HANDOFF.md for the one-time setup steps."""
+    creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS_JSON")
+    sheet_id = os.environ.get("FEEDBACK_SHEET_ID")
+    if not creds_json or not sheet_id:
+        return None
+    try:
+        import gspread
+        gc = gspread.service_account_from_dict(json.loads(creds_json))
+        sheet = gc.open_by_key(sheet_id).sheet1
+        if not sheet.row_values(1):
+            sheet.append_row(FEEDBACK_LOG_HEADER)
+        return sheet
+    except Exception:
+        logger.exception("failed to connect to the feedback Google Sheet")
+        return None
+
+
+def log_feedback(rating: int | None, comment: str):
+    """Records one feedback submission -- always to stdout + a local CSV (the same
+    zero-infrastructure pattern as usage_log.csv), and additionally to a shared Google Sheet when
+    that's configured. The Sheet write is additive, not load-bearing: local logging always happens
+    first and independently, so a misconfigured or briefly-unreachable Sheet never loses feedback or
+    breaks the submit action for the user."""
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    origin = st.session_state.get("origin", "")
+    destination = st.session_state.get("destination", "")
+    comment = (comment or "").strip()
+
+    logger.info("feedback version=%s rating=%s comment=%r origin=%r destination=%r",
+                APP_VERSION, rating, comment, origin, destination)
+    try:
+        file_exists = os.path.exists(FEEDBACK_LOG_PATH)
+        with open(FEEDBACK_LOG_PATH, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(FEEDBACK_LOG_HEADER)
+            writer.writerow([timestamp, APP_VERSION, rating, comment, origin, destination])
+    except Exception:
+        logger.exception("failed to write feedback_log.csv")
+
+    sheet = _get_feedback_worksheet()
+    if sheet is not None:
+        try:
+            sheet.append_row([timestamp, APP_VERSION, rating, comment, origin, destination])
+        except Exception:
+            logger.exception("failed to append feedback to the Google Sheet")
 
 
 # Hand-rolled instead of using the `polyline` pip package or Google's Static Maps API (which would
@@ -107,6 +229,42 @@ def decode_polyline(encoded: str) -> list[tuple[float, float]]:
                 lng += delta
         points.append((lat / 1e5, lng / 1e5))
     return points
+
+
+def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """Great-circle distance in km -- accurate enough for placing a stop on a route visualization;
+    not meant for turn-by-turn precision."""
+    r = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lng2 - lng1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def route_cumulative_km(path: list[tuple[float, float]]) -> list[float]:
+    """Cumulative distance (km) from the route's start to each point in a decoded polyline."""
+    cum = [0.0]
+    for i in range(1, len(path)):
+        cum.append(cum[-1] + _haversine_km(*path[i - 1], *path[i]))
+    return cum
+
+
+def distance_along_route_km(path: list[tuple[float, float]], cum: list[float], lat: float, lng: float) -> float:
+    """How far along the route (km from the origin) the *nearest polyline point* to (lat, lng) is --
+    this is what actually places a stop proportionally on The Strip (see DESIGN_CONCEPTS.md), from
+    the stop's own real coordinates (already tracked in discovered_places from the Places API), not
+    a guessed or model-estimated distance. A decoded Google polyline is normally dense enough
+    (points every ~10-50m on a highway route) that nearest-vertex matching is accurate enough for a
+    visualization; this deliberately doesn't do true point-to-segment projection onto the polyline,
+    since that precision isn't needed here and isn't worth the added complexity."""
+    best_i, best_d = 0, float("inf")
+    for i, (plat, plng) in enumerate(path):
+        d = _haversine_km(lat, lng, plat, plng)
+        if d < best_d:
+            best_d, best_i = d, i
+    return cum[best_i]
+
 
 _timezone_finder = TimezoneFinder()
 
@@ -215,7 +373,8 @@ def _tool_call_detail(name: str, kwargs: dict) -> str:
     """Short human-readable suffix for a tool call, used both in the live progress status and the
     usage log -- e.g. what category was searched, or how many places were looked up."""
     if name == "search_places_along_route":
-        return f" for \"{kwargs.get('category', '')}\""
+        cats = kwargs.get('categories') or []
+        return " for " + ", ".join(f'"{c}"' for c in cats)
     if name == "get_place_details_and_reviews":
         n = len(kwargs.get('place_ids') or [])
         return f" ({n} candidate place{'s' if n != 1 else ''})"
@@ -260,6 +419,37 @@ def timed_tool(func):
     return wrapper
 
 
+def _api_request(method: str, url: str, *, headers: dict | None = None, json_body: dict | None = None,
+                  params: dict | None = None, timeout: float = 12.0, max_attempts: int = 3) -> requests.Response:
+    """Calls a Maps/Places API endpoint with a timeout (none of these calls had one before, so a
+    single slow/stuck request could hang the whole plan indefinitely) and short retries on transient
+    failures -- a 5xx, a timeout, or a dropped connection. search_places_along_route in particular
+    has been observed to fail occasionally on a well-formed, valid request where an identical retry
+    immediately succeeds; previously the only retry was the user re-asking by hand.
+
+    'params' is for the legacy Places API's query-string auth/filter style (e.g. `key=...`); the
+    Places/Routes API (New) calls use header auth and a JSON body instead, via 'json_body'.
+
+    Does not retry 4xx responses -- those mean the request itself is wrong, and retrying won't help.
+    Raises requests.RequestException if every attempt fails on a network-level error (not a real
+    HTTP response); callers turn that into the same {"error": ...} dict shape used for a bad status.
+    """
+    response = None
+    for attempt in range(max_attempts):
+        try:
+            response = requests.request(method, url, headers=headers or {}, json=json_body, params=params, timeout=timeout)
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt == max_attempts - 1:
+                raise
+            time.sleep(0.75 * (attempt + 1))
+            continue
+        if response.status_code < 500:
+            return response
+        if attempt < max_attempts - 1:
+            time.sleep(0.75 * (attempt + 1))
+    return response
+
+
 @timed_tool
 def calculate_route_and_etas(origin: str, destination: str, departure_time_iso: str) -> dict:
     """
@@ -270,31 +460,99 @@ def calculate_route_and_etas(origin: str, destination: str, departure_time_iso: 
     if not api_key:
         return {"error": "GOOGLE_MAPS_API_KEY is not configured on the server."}
 
-    url = "https://routes.googleapis.com/directions/v2:computeRoutes"
-    headers = {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": api_key,
-        "X-Goog-FieldMask": "routes.duration,routes.distanceMeters,routes.legs.duration,routes.legs.distanceMeters,routes.legs.polyline.encodedPolyline,routes.polyline.encodedPolyline,routes.travelAdvisory.tollInfo"
-    }
-    data = {
-        "origin": {"address": origin},
-        "destination": {"address": destination},
-        "departureTime": departure_time_iso,
-        "travelMode": "DRIVE",
-        "routingPreference": "TRAFFIC_AWARE",
-        "computeAlternativeRoutes": False,
-        "languageCode": "en-US",
-        "units": "METRIC",
-        # Toll estimates are opt-in: extraComputations must list "TOLLS", and the API requires
-        # routeModifiers.vehicleInfo to be present (any value) before it will compute a price.
-        "extraComputations": ["TOLLS"],
-        "routeModifiers": {"vehicleInfo": {"emissionType": "GASOLINE"}}
-    }
+    # Routes API (New) hard-rejects a departureTime that isn't strictly in the future -- verified
+    # directly against the live API: "400 INVALID_ARGUMENT: Timestamp must be set to a future time."
+    # This is a real, observed failure mode, not theoretical: departure_time_iso is computed once
+    # when planning starts, but a single AFC round trip has been measured at 30-80+ seconds of
+    # Gemini's own latency (see ARCHITECTURE.md) -- on a slow or retried plan, the instant this tool
+    # actually runs can land after a timestamp that was still valid when the request was built.
+    # Bumping forward to "now + a small buffer" whenever the given time has already passed turns
+    # that from a guaranteed 400 into a request that still succeeds, just a minute or two later than
+    # what was originally asked for.
+    try:
+        parsed_departure = datetime.fromisoformat(departure_time_iso.replace('Z', '+00:00'))
+    except ValueError:
+        parsed_departure = None
+    now = datetime.now(timezone.utc)
+    if parsed_departure is None or parsed_departure <= now:
+        departure_time_iso = (now + timedelta(minutes=1)).isoformat().replace('+00:00', 'Z')
 
-    response = requests.post(url, headers=headers, json=data)
-    if not response.ok:
-        return {"error": f"Routes API error {response.status_code}: {response.text}"}
-    routes_data = response.json()
+    def _route_new():
+        url = "https://routes.googleapis.com/directions/v2:computeRoutes"
+        headers = {
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": api_key,
+            "X-Goog-FieldMask": "routes.duration,routes.distanceMeters,routes.legs.duration,routes.legs.distanceMeters,routes.legs.polyline.encodedPolyline,routes.polyline.encodedPolyline,routes.travelAdvisory.tollInfo"
+        }
+        data = {
+            "origin": {"address": origin},
+            "destination": {"address": destination},
+            "departureTime": departure_time_iso,
+            "travelMode": "DRIVE",
+            "routingPreference": "TRAFFIC_AWARE",
+            "computeAlternativeRoutes": False,
+            "languageCode": "en-US",
+            "units": "METRIC",
+            # Toll estimates are opt-in: extraComputations must list "TOLLS", and the API requires
+            # routeModifiers.vehicleInfo to be present (any value) before it will compute a price.
+            "extraComputations": ["TOLLS"],
+            "routeModifiers": {"vehicleInfo": {"emissionType": "GASOLINE"}}
+        }
+        try:
+            response = _api_request("POST", url, headers=headers, json_body=data)
+        except requests.RequestException as exc:
+            return None, f"Routes API (New) request failed: {exc}"
+        if not response.ok:
+            return None, f"Routes API (New) error {response.status_code}: {response.text}"
+        return response.json(), None
+
+    def _route_legacy():
+        # Fallback for when Routes API (New) is down/failing. The legacy Directions API has no
+        # structured toll-price field (that's a Routes API v2-only feature), so a route served by
+        # this tier comes back with estimated_toll_cost=None -- a real, acceptable degradation,
+        # same as legacy Places results coming back missing a couple of fields New provides.
+        # Normalizes the response into the same {'routes': [...]} shape _route_new returns so
+        # every line below this point stays identical regardless of which tier served it.
+        try:
+            dep_ts = int(datetime.fromisoformat(departure_time_iso).timestamp())
+        except ValueError:
+            dep_ts = "now"
+        params = {"origin": origin, "destination": destination, "departure_time": dep_ts,
+                  "mode": "driving", "key": api_key}
+        try:
+            response = _api_request("GET", "https://maps.googleapis.com/maps/api/directions/json", params=params)
+        except requests.RequestException as exc:
+            return None, f"Directions API (legacy) request failed: {exc}"
+        if not response.ok:
+            return None, f"Directions API (legacy) error {response.status_code}: {response.text}"
+        payload = response.json()
+        if payload.get('status') != 'OK' or not payload.get('routes'):
+            return None, f"Directions API (legacy) status {payload.get('status')}"
+        leg = payload['routes'][0]['legs'][0]
+        duration_s = leg.get('duration_in_traffic', leg.get('duration', {})).get('value', 0)
+        distance_m = leg.get('distance', {}).get('value', 0)
+        polyline = payload['routes'][0].get('overview_polyline', {}).get('points', '')
+        return {"routes": [{
+            "duration": f"{duration_s}s",
+            "distanceMeters": distance_m,
+            "legs": [{"duration": f"{duration_s}s", "distanceMeters": distance_m,
+                      "polyline": {"encodedPolyline": polyline}}],
+            "polyline": {"encodedPolyline": polyline},
+            "travelAdvisory": {},
+        }]}, None
+
+    routes_data, error = _route_new()
+    source = "new"
+    if error:
+        print(f"[calculate_route_and_etas] falling back to legacy Directions API after: {error}", flush=True)
+        routes_data, legacy_error = _route_legacy()
+        source = "legacy"
+        if legacy_error:
+            stats = st.session_state.setdefault('_routes_api_stats', {'new': 0, 'legacy': 0, 'failed': 0})
+            stats['failed'] = stats.get('failed', 0) + 1
+            return {"error": f"Both Routes APIs failed -- new: {error}; legacy: {legacy_error}"}
+    stats = st.session_state.setdefault('_routes_api_stats', {'new': 0, 'legacy': 0, 'failed': 0})
+    stats[source] = stats.get(source, 0) + 1
 
     if not routes_data.get('routes'):
         return {"total_duration_seconds": 0, "total_distance_meters": 0, "legs": [], "encoded_overall_polyline": ""}
@@ -333,21 +591,31 @@ def calculate_route_and_etas(origin: str, destination: str, departure_time_iso: 
 
 
 @timed_tool
-def search_places_along_route(encoded_polyline: str, category: str) -> dict:
+def search_places_along_route(encoded_polyline: str, categories: list[str]) -> dict:
     """
-    Searches for places along an encoded polyline route matching a free-text query.
+    Searches for places along an encoded polyline route matching one or more free-text queries.
 
-    'category' has no default value on purpose: it used to default to "restaurant", which meant
-    the model would silently fall back to restaurant searches for any request it didn't reason
-    carefully about (e.g. "pick up snacks and drinks" still returned restaurants). Making it
-    required, plus the system prompt's explicit "don't default to restaurants" instruction, forces
-    the model to actually decide what kind of place fits the request.
+    'categories' has no default value on purpose: it used to be a single "category" string that
+    defaulted to "restaurant", which meant the model would silently fall back to restaurant
+    searches for any request it didn't reason carefully about (e.g. "pick up snacks and drinks"
+    still returned restaurants). Making it required, plus the system prompt's explicit "don't
+    default to restaurants" instruction, forces the model to actually decide what kind of place
+    fits the request.
 
-    'category' is a natural-language search query for whatever the user actually needs along the
-    route -- not limited to food. Pick a query that matches their request, e.g. "vegetarian
-    restaurant", "clean public restroom", "grocery store", "liquor store", "convenience store
-    selling snacks and drinks", "petrol pump", "pharmacy", "ATM". Call this once per distinct kind
-    of stop the user needs.
+    Each entry in 'categories' is a natural-language search query for whatever the user actually
+    needs along the route -- not limited to food, e.g. "vegetarian restaurant", "clean public
+    restroom", "grocery store", "liquor store", "convenience store selling snacks and drinks",
+    "petrol pump", "pharmacy", "ATM".
+
+    Pass every distinct kind of stop the trip needs in ONE call instead of calling this once per
+    category -- each call is a full round trip through the model's own reasoning (observed at
+    30-80+ seconds apiece, versus ~1s for the underlying Places lookup itself), so one call
+    covering N categories is dramatically faster than N separate calls, the same reasoning
+    get_place_details_and_reviews below already applies to batching place_ids.
+
+    Returns {"results_by_category": {category: {"places": [...]} | {"error": "..."}}} -- one entry
+    per requested category, each independently either a places list or an error, so one bad/empty
+    category never blocks the results for the others.
     """
     api_key = st.session_state.get("google_maps_api_key")
     if not api_key:
@@ -363,50 +631,125 @@ def search_places_along_route(encoded_polyline: str, category: str) -> dict:
         "X-Goog-Api-Key": api_key,
         "X-Goog-FieldMask": "places.id,places.displayName.text,places.rating,places.userRatingCount,places.location,places.types,places.formattedAddress"
     }
-    data = {
-        "textQuery": category,
-        "searchAlongRouteParameters": {"polyline": {"encodedPolyline": encoded_polyline}},
-        "pageSize": 20,
-        "languageCode": "en-US",
-        "minRating": 3.5,
-    }
 
-    response = requests.post(url, headers=headers, json=data)
-    if not response.ok:
-        # This call fails occasionally and transiently even with a valid, well-formed request --
-        # observed once with a real 360km route that a direct retry of the identical request
-        # immediately succeeded on. This print is deliberately kept (error path only, not per-call)
-        # so a recurrence shows up in server logs with enough detail to tell transient flakiness
-        # apart from a real, reproducible request problem.
-        print(f"[search_places_along_route] category={category!r} polyline_len={len(encoded_polyline)} HTTP {response.status_code}: {response.text}", flush=True)
-        return {"error": f"Places API error {response.status_code}: {response.text}"}
-    places_data = response.json()
+    def _search_new(category: str):
+        data = {
+            "textQuery": category,
+            "searchAlongRouteParameters": {"polyline": {"encodedPolyline": encoded_polyline}},
+            "pageSize": 20,
+            "languageCode": "en-US",
+            "minRating": 3.5,
+        }
+        try:
+            response = _api_request("POST", url, headers=headers, json_body=data)
+        except requests.RequestException as exc:
+            print(f"[search_places_along_route] category={category!r} polyline_len={len(encoded_polyline)} request failed: {exc}", flush=True)
+            return None, f"Places API (New) request failed: {exc}"
+        if not response.ok:
+            # _api_request already retried transient 5xx a couple of times -- this is logged (error
+            # path only, not per-call) so a recurrence past those retries still shows in server logs.
+            print(f"[search_places_along_route] category={category!r} polyline_len={len(encoded_polyline)} HTTP {response.status_code}: {response.text}", flush=True)
+            return None, f"Places API (New) error {response.status_code}: {response.text}"
+        return response.json().get('places', []), None
 
-    places = []
+    def _search_legacy(category: str):
+        # Fallback for when Places API (New) is down/failing -- the legacy Places API has no
+        # "search along route" parameter at all, so this approximates it by running a Nearby Search
+        # around a handful of points sampled along the route polyline and merging/deduping the
+        # results, instead of one precise along-route query. Normalizes into the exact same shape
+        # _search_new returns (a New-API-style 'places' list) so every line below this point stays
+        # identical regardless of which tier actually served the data.
+        path = decode_polyline(encoded_polyline)
+        if not path:
+            return None, "no route polyline available for the legacy fallback"
+        sample_n = min(4, len(path))
+        step = (len(path) - 1) / (sample_n - 1) if sample_n > 1 else 0
+        points = [path[round(i * step)] for i in range(sample_n)]
+
+        seen = {}
+        for lat, lng in points:
+            params = {"location": f"{lat},{lng}", "radius": 15000, "keyword": category, "key": api_key}
+            try:
+                response = _api_request("GET", "https://maps.googleapis.com/maps/api/place/nearbysearch/json", params=params)
+            except requests.RequestException:
+                continue
+            if not response.ok:
+                continue
+            for r in response.json().get('results', []):
+                place_id = r.get('place_id')
+                if not place_id or place_id in seen or (r.get('rating') or 0) < 3.5:
+                    continue
+                loc = r.get('geometry', {}).get('location', {})
+                seen[place_id] = {
+                    "id": place_id,
+                    "displayName": {"text": r.get('name', '')},
+                    "rating": r.get('rating'),
+                    "userRatingCount": r.get('user_ratings_total'),
+                    "formattedAddress": r.get('vicinity', ''),
+                    "types": r.get('types', []),
+                    "location": {"latitude": loc.get('lat'), "longitude": loc.get('lng')},
+                }
+        if not seen:
+            return None, "legacy Places API returned no results either"
+        return list(seen.values()), None
+
+    def _fetch(category: str):
+        # Runs in a worker thread -- network I/O only, no st.session_state access (see the note in
+        # get_place_details_and_reviews below for why that matters).
+        places, error = _search_new(category)
+        source = "new"
+        if error:
+            print(f"[search_places_along_route] category={category!r} falling back to legacy Places API after: {error}", flush=True)
+            places, legacy_error = _search_legacy(category)
+            source = "legacy"
+            if legacy_error:
+                return category, None, f"Both Places APIs failed -- new: {error}; legacy: {legacy_error}", "failed"
+        return category, places, None, source
+
+    with ThreadPoolExecutor(max_workers=min(8, len(categories)) or 1) as executor:
+        fetched = list(executor.map(_fetch, categories))
+
     if 'discovered_places' not in st.session_state:
         st.session_state.discovered_places = {}
-    for p_data in places_data.get('places', [])[:5]:
-        places.append({
-            "place_id": p_data['id'],
-            "name": p_data['displayName']['text'],
-            "rating": p_data.get('rating'),
-            "user_ratings_total": p_data.get('userRatingCount'),
-            "vicinity": p_data.get('formattedAddress', ''),
-            "types": p_data.get('types', [])[:4]
-        })
 
-        # Track every discovered place so the UI can offer a "Navigate" link and a map marker for
-        # it later -- the chat response is free-form text, so this is the only reliable source of
-        # real place_ids and coordinates. Lat/lng isn't sent to the model, just stashed for the UI.
-        location = p_data.get('location', {})
-        st.session_state.discovered_places[p_data['id']] = {
-            "name": p_data['displayName']['text'],
-            "vicinity": p_data.get('formattedAddress', ''),
-            "lat": location.get('latitude'),
-            "lng": location.get('longitude'),
-        }
+    # Tracks which tier (new/legacy/failed) actually served each category's results this request --
+    # read by log_usage_event so "how often is the fallback needed, how often do both fail" is a
+    # real, trackable number instead of something only visible by reading server logs (see HANDOFF.md).
+    api_stats = st.session_state.setdefault('_places_api_stats', {'new': 0, 'legacy': 0, 'failed': 0})
 
-    return {"places": places}
+    results_by_category = {}
+    for category, places_data, error, source in fetched:
+        api_stats[source] = api_stats.get(source, 0) + 1
+        if error:
+            results_by_category[category] = {"error": error}
+            continue
+
+        places = []
+        for p_data in places_data[:5]:
+            places.append({
+                "place_id": p_data['id'],
+                "name": p_data['displayName']['text'],
+                "rating": p_data.get('rating'),
+                "user_ratings_total": p_data.get('userRatingCount'),
+                "vicinity": p_data.get('formattedAddress', ''),
+                "types": p_data.get('types', [])[:4]
+            })
+
+            # Track every discovered place so the UI can offer a "Navigate" link and a map marker
+            # for it later -- the chat response is free-form text, so this is the only reliable
+            # source of real place_ids and coordinates. Lat/lng isn't sent to the model, just
+            # stashed for the UI.
+            location = p_data.get('location', {})
+            st.session_state.discovered_places[p_data['id']] = {
+                "name": p_data['displayName']['text'],
+                "vicinity": p_data.get('formattedAddress', ''),
+                "lat": location.get('latitude'),
+                "lng": location.get('longitude'),
+            }
+
+        results_by_category[category] = {"places": places}
+
+    return {"results_by_category": results_by_category}
 
 
 @timed_tool
@@ -438,14 +781,92 @@ def get_place_details_and_reviews(place_ids: list[str]) -> dict:
         "X-Goog-FieldMask": "id,displayName.text,rating,userRatingCount,formattedAddress,nationalPhoneNumber,websiteUri,currentOpeningHours,priceLevel,regularOpeningHours,reviews,servesBreakfast,servesLunch,servesDinner,servesVegetarianFood,parkingOptions,photos"
     }
 
-    results = []
-    for place_id in place_ids:
+    def _details_new(place_id: str):
         url = f"https://places.googleapis.com/v1/places/{place_id}"
-        response = requests.get(url, headers=headers)
+        try:
+            response = _api_request("GET", url, headers=headers)
+        except requests.RequestException as exc:
+            return None, f"Places API (New) request failed: {exc}"
         if not response.ok:
-            results.append({"place_id": place_id, "error": f"Places API error {response.status_code}: {response.text}"})
+            return None, f"Places API (New) error {response.status_code}: {response.text}"
+        return response.json(), None
+
+    def _details_legacy(place_id: str):
+        # Fallback for when Places API (New) is down/failing. Normalizes the legacy response into
+        # the exact same shape _details_new returns (New-API field names) so the review/parking/
+        # price-level processing below stays identical regardless of which tier served the data --
+        # a few fields legacy simply doesn't have (servesVegetarianFood, parkingOptions, photos)
+        # come back empty/null rather than guessed, same as a real "not listed by Google" case today.
+        params = {
+            "place_id": place_id,
+            "fields": "name,rating,user_ratings_total,formatted_address,opening_hours,price_level,reviews",
+            "key": api_key,
+        }
+        try:
+            response = _api_request("GET", "https://maps.googleapis.com/maps/api/place/details/json", params=params)
+        except requests.RequestException as exc:
+            return None, f"Places API (legacy) request failed: {exc}"
+        if not response.ok:
+            return None, f"Places API (legacy) error {response.status_code}: {response.text}"
+        payload = response.json()
+        if payload.get('status') != 'OK':
+            return None, f"Places API (legacy) status {payload.get('status')}"
+        result = payload.get('result', {})
+        reviews = []
+        for r in result.get('reviews', []):
+            ts = r.get('time')
+            reviews.append({
+                "authorAttribution": {"displayName": r.get('author_name', 'Anonymous')},
+                "rating": r.get('rating', 0),
+                "text": {"text": r.get('text', '')},
+                "relativePublishTimeDescription": r.get('relative_time_description'),
+                # legacy gives a unix timestamp, not RFC3339 -- convert so the recency sort below
+                # (which compares publishTime as a string) still works the same way either tier.
+                "publishTime": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else "",
+            })
+        opening_hours = result.get('opening_hours')
+        return {
+            "displayName": {"text": result.get('name', '')},
+            "regularOpeningHours": opening_hours,
+            "currentOpeningHours": {"openNow": opening_hours.get('open_now')} if opening_hours else {},
+            "priceLevel": result.get('price_level'),
+            "servesBreakfast": None, "servesLunch": None, "servesDinner": None, "servesVegetarianFood": None,
+            "parkingOptions": {},
+            "reviews": reviews,
+            "photos": [],
+        }, None
+
+    def _fetch(place_id: str):
+        # Runs in a worker thread -- network I/O only, no st.session_state access. Streamlit's
+        # session_state is tied to the calling thread's ScriptRunContext and isn't safe to touch
+        # from a worker thread; every session_state write below happens after results are gathered
+        # back on the main thread.
+        details_data, error = _details_new(place_id)
+        source = "new"
+        if error:
+            print(f"[get_place_details_and_reviews] place_id={place_id!r} falling back to legacy Places API after: {error}", flush=True)
+            details_data, legacy_error = _details_legacy(place_id)
+            source = "legacy"
+            if legacy_error:
+                return place_id, None, f"Both Places APIs failed -- new: {error}; legacy: {legacy_error}", "failed"
+        return place_id, details_data, None, source
+
+    # Fetched in parallel -- these are independent GET requests, one per candidate place, previously
+    # issued one at a time so total latency scaled with the number of places being evaluated instead
+    # of the slowest single one.
+    with ThreadPoolExecutor(max_workers=min(8, len(place_ids)) or 1) as executor:
+        fetched = list(executor.map(_fetch, place_ids))
+
+    # See the matching comment in search_places_along_route -- same tracked-tier pattern, same key,
+    # so one request's stats cover both tools' underlying Places calls together.
+    api_stats = st.session_state.setdefault('_places_api_stats', {'new': 0, 'legacy': 0, 'failed': 0})
+
+    results = []
+    for place_id, details_data, error, source in fetched:
+        api_stats[source] = api_stats.get(source, 0) + 1
+        if error:
+            results.append({"place_id": place_id, "error": error})
             continue
-        details_data = response.json()
 
         # Process every review Google actually returns (New Places API caps this at 5) before
         # slicing anything down -- picking the "top 3" first, as this used to, meant recency and
@@ -1215,6 +1636,158 @@ def render_print_button():
     )
 
 
+# "The Strip" -- the route-native layout explored via an Artifact mockup and documented in
+# DESIGN_CONCEPTS.md, built here against real data instead of hand-authored HTML. Self-contained
+# palette (not reconciled with the rest of the app's theme -- see DESIGN.md's own note that nothing
+# in this app is on one shared token set yet), but does respect light/dark via prefers-color-scheme.
+_STRIP_CSS = """
+<style>
+.strip {
+    --strip-ink: #1a1a1a; --strip-paper: #f5f4f0; --strip-paper-raised: #ffffff;
+    --strip-line: #b8b6ae; --strip-mute: #75726a; --strip-accent: #b3502c;
+    position: relative; display: flex; flex-direction: column; padding: 18px 16px 18px 46px;
+    min-height: 440px; margin: 4px 0 18px; background: var(--strip-paper); border-radius: 8px;
+}
+@media (prefers-color-scheme: dark) {
+    .strip {
+        --strip-ink: #ece9e2; --strip-paper: #1c1b18; --strip-paper-raised: #262521;
+        --strip-line: #45433c; --strip-mute: #a29d90; --strip-accent: #e08a5c;
+    }
+}
+.strip::before {
+    content: ""; position: absolute; left: 18px; top: 22px; bottom: 22px; width: 4px;
+    background: repeating-linear-gradient(var(--strip-ink) 0 14px, transparent 14px 22px);
+}
+.strip-node { position: relative; flex: 0 0 auto; color: var(--strip-ink); }
+.strip-node::before {
+    content: ""; position: absolute; left: -34px; top: 4px; width: 12px; height: 12px; border-radius: 50%;
+    background: var(--strip-paper); border: 3px solid var(--strip-ink);
+}
+.strip-node.decision::before { border-color: var(--strip-accent); }
+.strip-km {
+    position: absolute; left: -30px; top: -13px; white-space: nowrap; font-size: 0.68rem;
+    color: var(--strip-mute); font-variant-numeric: tabular-nums;
+}
+.strip-row { padding: 6px 0 4px; }
+.strip-title { font-weight: 700; }
+.strip-time { color: var(--strip-mute); font-size: 0.9rem; margin-left: 8px; }
+.strip-gap { flex-shrink: 0; min-height: 20px; position: relative; display: flex; align-items: center; }
+.strip-gap-label { font-size: 0.66rem; color: var(--strip-mute); font-style: italic; }
+.strip-cluster {
+    border-left: 2px solid var(--strip-accent); margin-top: 6px; padding-left: 14px;
+    display: flex; flex-wrap: wrap; gap: 6px;
+}
+.strip-chip {
+    font-size: 0.82rem; padding: 6px 10px; border-radius: 4px; border: 1px solid var(--strip-line);
+    background: var(--strip-paper-raised); color: var(--strip-ink); max-width: 240px;
+}
+.strip-chip-rating { color: var(--strip-mute); font-size: 0.78rem; }
+.strip-chip-verdict { font-size: 0.74rem; color: var(--strip-mute); margin-top: 2px; }
+</style>
+"""
+
+
+def render_the_strip(plan: dict) -> bool:
+    """Route-native itinerary visualization: vertical position is real km along the route, segment
+    length between stops is flex-grow(sqrt(gap_km)) against a fixed track (see DESIGN_CONCEPTS.md
+    for why sqrt, not linear km or hand-placed pixels), computed by matching each stop's actual
+    coordinates against the decoded route polyline -- not a guessed or model-estimated position.
+
+    Each stop_categories entry becomes one decision cluster, positioned at the average real
+    distance-along-route of its options that have a resolvable place_id/coordinate (most won't
+    differ by more than a km or two in practice, since a category's candidates are all searched
+    along the same stretch of road). A category with no resolvable coordinate at all is silently
+    skipped -- it simply can't be placed on a route-native layout without one.
+
+    Returns True if it actually rendered something, so the caller can fall back to the plain
+    itinerary table when there's no polyline yet (e.g. structured output degraded to plain text for
+    this turn) instead of the trip silently having no itinerary visualization at all."""
+    polyline = st.session_state.get('route_polyline')
+    places = st.session_state.get('discovered_places', {})
+    if not polyline:
+        return False
+
+    path = decode_polyline(polyline)
+    if len(path) < 2:
+        return False
+    cum = route_cumulative_km(path)
+    total_km = cum[-1]
+    if total_km <= 0:
+        return False
+
+    overview = plan.get('trip_overview', {})
+    origin = st.session_state.get('origin', 'Origin')
+    destination = st.session_state.get('destination', 'Destination')
+
+    nodes = [{
+        "km": 0.0, "title": f"Depart {origin}", "time": overview.get('departure_time_text', ''),
+        "decision": False, "options": None,
+    }]
+    for category in plan.get('stop_categories') or []:
+        options = category.get('options') or []
+        positions = []
+        for opt in options:
+            place = places.get(opt.get('place_id'))
+            if place and place.get('lat') is not None and place.get('lng') is not None:
+                positions.append(distance_along_route_km(path, cum, place['lat'], place['lng']))
+        if not positions:
+            continue
+        nodes.append({
+            "km": sum(positions) / len(positions),
+            "title": f"{category.get('emoji', '')} {category.get('title', '')}".strip(),
+            "time": None, "decision": True, "options": options,
+        })
+    nodes.append({
+        "km": total_km, "title": f"Arrive {destination}", "time": overview.get('arrival_time_text', ''),
+        "decision": False, "options": None,
+    })
+    nodes.sort(key=lambda n: n["km"])
+
+    if len(nodes) <= 2:
+        # Only depart/arrive, no placeable category -- the plain table is more useful than an
+        # almost-empty Strip with nothing but two endpoints on it.
+        return False
+
+    def esc(s: str) -> str:
+        return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    parts = []
+    for i, node in enumerate(nodes):
+        node_class = "strip-node decision" if node["decision"] else "strip-node"
+        km_label = f"{node['km']:.0f}km" if node["km"] >= 0.5 else "0km"
+        time_html = f'<span class="strip-time">{esc(node["time"])}</span>' if node.get("time") else ""
+        title_html = f'<span class="strip-title">{esc(node["title"])}</span>'
+
+        options_html = ""
+        if node["options"]:
+            chips = []
+            for opt in node["options"][:3]:
+                name = esc(opt.get("name", "Unknown"))
+                rating = esc(opt.get("rating_text", ""))
+                verdict = esc(opt.get("verdict", ""))
+                rating_html = f'<span class="strip-chip-rating"> · {rating}</span>' if rating else ""
+                verdict_html = f'<div class="strip-chip-verdict">{verdict}</div>' if verdict else ""
+                chips.append(f'<div class="strip-chip"><b>{name}</b>{rating_html}{verdict_html}</div>')
+            options_html = f'<div class="strip-cluster">{"".join(chips)}</div>'
+
+        parts.append(
+            f'<div class="{node_class}"><span class="strip-km">{km_label}</span>'
+            f'<div class="strip-row">{title_html}{time_html}{options_html}</div></div>'
+        )
+
+        if i < len(nodes) - 1:
+            gap_km = max(nodes[i + 1]["km"] - node["km"], 0.01)
+            flex = max(math.sqrt(gap_km), 0.3)
+            gap_label = f"{gap_km:.0f} km" if gap_km >= 1 else f"{gap_km * 1000:.0f} m"
+            parts.append(
+                f'<div class="strip-gap" style="flex-grow:{flex:.2f}">'
+                f'<span class="strip-gap-label">{gap_label}</span></div>'
+            )
+
+    st.markdown(_STRIP_CSS + f'<div class="strip">{"".join(parts)}</div>', unsafe_allow_html=True)
+    return True
+
+
 def render_plan_cards(plan: dict):
     """Renders the current active plan as real Streamlit elements -- a card per option with its own
     copy/share control, plus a whole-itinerary share/print section -- instead of one flat Markdown
@@ -1240,10 +1813,12 @@ def render_plan_cards(plan: dict):
     overview_lines.append(f"- **Estimated Arrival:** {overview.get('arrival_time_text', '—')}")
     st.markdown("\n".join(overview_lines))
 
-    timeline = plan.get("itinerary_timeline") or []
-    if timeline:
-        rows = "\n".join(f"| {item.get('time', '')} | {item.get('label', '')} |" for item in timeline)
-        st.markdown("### ⏱️ Itinerary Timeline\n| Time | Stop |\n|---|---|\n" + rows)
+    st.markdown("### ⏱️ Itinerary")
+    if not render_the_strip(plan):
+        timeline = plan.get("itinerary_timeline") or []
+        if timeline:
+            rows = "\n".join(f"| {item.get('time', '')} | {item.get('label', '')} |" for item in timeline)
+            st.markdown("| Time | Stop |\n|---|---|\n" + rows)
 
     notes = plan.get("proactive_notes") or []
     if notes:
@@ -1304,6 +1879,10 @@ def response_to_markdown(response_text: str) -> tuple[str, dict]:
 st.set_page_config(page_title="🧭 Journey Concierge", layout="wide")
 
 st.title("🧭 Journey Concierge")
+st.caption(
+    "Live, verified stops for food, fuel, and rest — planned along your actual route and verified "
+    "live on Google Maps."
+)
 render_home_illustrations()
 
 # .streamlit/config.toml's theme.font/headingFont correctly set the CSS font-family (confirmed via
@@ -1354,7 +1933,12 @@ st.header("Trip Details")
 col1, col2 = st.columns(2)
 
 with col1:
-    origin_search = st.text_input("Search Origin", value="Anantapur")
+    # Was Anantapur -> Kurnool (this app's original testing route, per HANDOFF.md -- "this app's
+    # home turf"). Bengaluru -> Ooty is a classic weekend road trip with friends -- a widely
+    # recognizable, genuinely popular hill-station corridor -- a better first impression for someone
+    # who's never used the app before, and pairs naturally with the "road trip with friends" default
+    # preferences text below.
+    origin_search = st.text_input("Search Origin", value="Bengaluru")
     if st.session_state.get("google_maps_api_key") and origin_search:
         origin_options = get_place_predictions(origin_search, st.session_state.google_maps_api_key)
     else:
@@ -1362,7 +1946,7 @@ with col1:
     origin = st.selectbox("📍 Confirmed Origin (Google Maps)", options=origin_options)
 
 with col2:
-    dest_search = st.text_input("Search Destination", value="Kurnool")
+    dest_search = st.text_input("Search Destination", value="Ooty")
     if st.session_state.get("google_maps_api_key") and dest_search:
         dest_options = get_place_predictions(dest_search, st.session_state.google_maps_api_key)
     else:
@@ -1430,7 +2014,10 @@ with qp_col4:
 
 preferences_notes = st.text_area(
     "Preferences / Notes",
-    "Traveling with elderly parents, need pure veg and clean restrooms"
+    # Was "Traveling with elderly parents..." -- a specific caregiving scenario from early testing,
+    # not a representative default. Road trip with friends pairs naturally with the Bengaluru ->
+    # Ooty default route below, a genuinely popular weekend-getaway corridor for exactly that.
+    "Road trip with friends — prefer vegetarian food and clean restrooms along the way"
 )
 
 _quick_prefs = []
@@ -1574,8 +2161,11 @@ if st.session_state.get('planning_triggered', False):
         "google_search is only for double-checking a place get_place_details_and_reviews already returned with "
         "very few reviews, not for discovering new candidate places when search_places_along_route fails. "
         "When calculating ETAs, consider the 'departure_time_iso' for traffic. "
-        "Always try to find multiple suitable options so you have real candidates to present as choices (see above), "
-        "but call search_places_along_route at most once per kind of stop needed. "
+        "Always try to find multiple suitable options so you have real candidates to present as choices (see above). "
+        "Call search_places_along_route exactly once per plan, passing every distinct kind of stop the trip needs "
+        "together in its categories list (e.g. ['vegetarian restaurant', 'clean public restroom', 'petrol pump']) "
+        "instead of calling it separately per category -- each call is a slow round trip through your own "
+        "reasoning, so batching every category into one call is what keeps the plan fast. "
         "Call get_place_details_and_reviews exactly once, passing the place_ids of every candidate place "
         "you want details for together in one list, instead of calling it separately per place. "
         "Every option that came from a real tool result has a real place_id from that tool response -- always "
@@ -1609,8 +2199,9 @@ if st.session_state.get('planning_triggered', False):
         "~12:30-3pm, dinner ~7:30-10:30pm). If the journey overlaps one, proactively suggest a food stop timed to "
         "that point even if the user only asked for something else like fuel or snacks -- people traveling around "
         "mealtimes usually want to eat too. "
-        "- Call search_places_along_route with a query like 'clean public restroom' or 'rest area' -- and include "
-        "a distinct stop_categories entry (title like '🚻 Restroom Stops') with real results from it -- only when "
+        "- Include a query like 'clean public restroom' or 'rest area' in the categories you pass to "
+        "search_places_along_route -- and include a distinct stop_categories entry (title like '🚻 Restroom "
+        "Stops') with real results from it -- only when "
         "the total drive duration exceeds 2 hours, or when the user specifically asked for restrooms regardless "
         "of trip length. Don't run "
         "this search for short trips unless it was actually requested. When it does apply, don't consider a food "
@@ -1693,13 +2284,16 @@ if st.session_state.get('planning_triggered', False):
         status = st.status("Planning your trip and evaluating live stops...", expanded=True)
         st.session_state._progress_status = status
         st.session_state._tool_trace = []
+        st.session_state._places_api_stats = {}
+        st.session_state._routes_api_stats = {}
         start = time.monotonic()
         response = chat.send_message(prompt)
         duration_s = time.monotonic() - start
         status.update(label=f"✅ Plan ready in {duration_s:.1f}s", state="complete")
         content, response_meta = response_to_markdown(response.text)
         log_usage_event("plan", st.session_state.origin, st.session_state.destination,
-                         st.session_state.preferences, duration_s, st.session_state._tool_trace, response_meta)
+                         st.session_state.preferences, duration_s, st.session_state._tool_trace, response_meta,
+                         st.session_state._places_api_stats, st.session_state._routes_api_stats)
         st.session_state._progress_status = None
         st.session_state.chat_messages.append({"role": "assistant", "content": content})
         if response_meta.get("structured_ok") and response_meta.get("response_type") == "plan":
@@ -1730,15 +2324,40 @@ if st.session_state.get('planning_triggered', False):
         status = st.status("Thinking...", expanded=True)
         st.session_state._progress_status = status
         st.session_state._tool_trace = []
+        st.session_state._places_api_stats = {}
+        st.session_state._routes_api_stats = {}
         start = time.monotonic()
         response = chat.send_message(followup)
         duration_s = time.monotonic() - start
         status.update(label=f"✅ Answered in {duration_s:.1f}s", state="complete")
         content, response_meta = response_to_markdown(response.text)
         log_usage_event("followup", st.session_state.origin, st.session_state.destination,
-                         followup, duration_s, st.session_state._tool_trace, response_meta)
+                         followup, duration_s, st.session_state._tool_trace, response_meta,
+                         st.session_state._places_api_stats, st.session_state._routes_api_stats)
         st.session_state._progress_status = None
         st.session_state.chat_messages.append({"role": "assistant", "content": content})
         if response_meta.get("structured_ok") and response_meta.get("response_type") == "plan":
             st.session_state.latest_plan_message_index = len(st.session_state.chat_messages) - 1
         st.rerun()
+
+# Always at the very end of the page, regardless of whether a trip has been planned yet -- someone
+# might want to say "the search box is confusing" without ever getting as far as a plan.
+st.divider()
+st.subheader("💬 Feedback")
+st.caption("Tell us what worked, what didn't, or what you wish this did.")
+if st.session_state.get("_feedback_submitted"):
+    st.success("Thanks for the feedback!")
+    st.session_state._feedback_submitted = False
+    # Must happen before the widgets below are instantiated this run -- writing to a widget's key
+    # after it already exists raises (same rule as the date/time quick-select buttons elsewhere).
+    st.session_state.feedback_comment = ""
+    st.session_state.feedback_rating = None
+feedback_rating = st.feedback("thumbs", key="feedback_rating")
+feedback_comment = st.text_area(
+    "Comments (optional)", key="feedback_comment",
+    placeholder="e.g. the restroom suggestions were spot on, but I wish I could filter by price...",
+)
+if st.button("Submit Feedback"):
+    log_feedback(feedback_rating, feedback_comment)
+    st.session_state._feedback_submitted = True
+    st.rerun()

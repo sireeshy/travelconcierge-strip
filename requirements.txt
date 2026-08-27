@@ -5,3 +5,4 @@ python-dateutil==2.9.0.post0
 python-dotenv==1.2.3
 timezonefinder==8.3.0
 tzdata
+gspread==6.2.1
