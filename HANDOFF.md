@@ -13,16 +13,22 @@ trips too, not just highway drives.
 
 ## Where things live
 
-- **Code**: `C:\Users\User.DESKTOP-HU2HPHC\Desktop\aiworkshop\travelconcierge\app.py` (single file)
-- **GitHub**: `https://github.com/sireeshy/travelconcierge` (owner: `sireeshy`, **not**
+- **Code**: `C:\Users\User.DESKTOP-HU2HPHC\Desktop\aiworkshop\travelconcierge-strip\app.py` (single
+  file; a sibling repo to `travelconcierge`, detached from its `origin` remote, for A/B-testing an
+  alternative itinerary UI — "The Strip", see `DESIGN_CONCEPTS.md`)
+- **GitHub**: `https://github.com/sireeshy/travelconcierge-strip` (owner: `sireeshy`, **not**
   `sireeshyeshwantapur` — an earlier, different GitHub account on this machine; don't push there)
-- **Deployed**: `https://travelconcierge-jpvntakkkybhcssslxgbls.streamlit.app/` (Streamlit
-  Community Cloud, auto-deploys on push to `main`)
+- **Deployed**: `https://travelconcierge-strip-kuk8ssmfvelakuvwmwwkj2.streamlit.app/` (Streamlit
+  Community Cloud, auto-deploys on push to `main`) — the original app's own deployment is separate:
+  `https://travelconcierge-jpvntakkkybhcssslxgbls.streamlit.app/`
 - **Local dev**: `.claude/launch.json` in the `knowledge_livestock` working directory runs it via
-  the project's `.venv`, port 8501
-- **Local secrets**: `.env` in the travelconcierge folder holds `GOOGLE_MAPS_API_KEY` and
-  `GEMINI_API_KEY` (gitignored). Streamlit Cloud has its own copies set as app secrets/env vars —
-  they are **not** synced automatically; update both places if a key rotates.
+  the project's `.venv`, port 8510
+- **Local secrets**: `.env` in the travelconcierge-strip folder holds `GOOGLE_MAPS_API_KEY`,
+  `GEMINI_API_KEY`, `GOOGLE_SHEETS_CREDENTIALS_JSON`, `USAGE_SHEET_ID`, `FEEDBACK_SHEET_ID`
+  (gitignored). Streamlit Cloud has its own copies set as app secrets/env vars — they are **not**
+  synced automatically; update both places if a key rotates. `USAGE_SHEET_ID`/`FEEDBACK_SHEET_ID`
+  point at the same two shared Google Sheets `travelconcierge` uses (see `ARCHITECTURE.md` §11) —
+  both apps write into the same Sheets, tagged by `APP_VERSION`, on purpose.
 
 ## Standing instruction from the user
 

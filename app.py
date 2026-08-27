@@ -44,6 +44,7 @@ USAGE_LOG_HEADER = [
     "places_api_new", "places_api_legacy", "places_api_failed",
     "routes_api_new", "routes_api_legacy", "routes_api_failed",
     "places_cache_fresh", "places_cache_verified", "places_cache_drift",
+    "error_detail",
 ]
 
 
@@ -83,7 +84,11 @@ def log_usage_event(event_type: str, origin: str, destination: str, preferences:
     'cache_fresh'/'cache_verified'/'cache_verify_failed' from get_place_details_and_reviews's
     place-details cache -- this is what makes the cache's actual payoff (how often a place lookup
     was free or half-price instead of a full paid call) a real, trackable number instead of an
-    assumed win.
+    assumed win. response_meta may also carry 'error_detail' (a short f"{type}: {message}" string)
+    when chat.send_message itself failed -- this is what lets a failure be diagnosed straight from
+    the Sheet (e.g. "ServerError: 503 UNAVAILABLE...") instead of requiring someone to manually
+    fetch and read Streamlit Cloud's own ephemeral server logs, which is otherwise the only place
+    that detail exists.
 
     Beyond timing, this is the performance signal for things that can silently degrade without
     anyone noticing in a chat UI: tool_errors catches a Gemini tool call that ultimately failed;
@@ -100,18 +105,19 @@ def log_usage_event(event_type: str, origin: str, destination: str, preferences:
     tool_errors = sum(1 for t in tool_trace if not t.get("ok", True))
     places_api_stats = places_api_stats or {}
     routes_api_stats = routes_api_stats or {}
+    error_detail = response_meta.get("error_detail", "")
     logger.info(
         "usage event=%s origin=%r destination=%r duration_s=%.2f tool_calls=%d tool_errors=%d "
         "places_api_new=%d places_api_legacy=%d places_api_failed=%d "
         "routes_api_new=%d routes_api_legacy=%d routes_api_failed=%d "
         "places_cache_fresh=%d places_cache_verified=%d places_cache_drift=%d "
-        "structured_ok=%s response_type=%s [%s]",
+        "structured_ok=%s response_type=%s error_detail=%r [%s]",
         event_type, origin, destination, duration_s, len(tool_trace), tool_errors,
         places_api_stats.get('new', 0), places_api_stats.get('legacy', 0), places_api_stats.get('failed', 0),
         routes_api_stats.get('new', 0), routes_api_stats.get('legacy', 0), routes_api_stats.get('failed', 0),
         places_api_stats.get('cache_fresh', 0), places_api_stats.get('cache_verified', 0),
         places_api_stats.get('cache_verify_failed', 0),
-        response_meta.get("structured_ok"), response_meta.get("response_type"), tool_summary,
+        response_meta.get("structured_ok"), response_meta.get("response_type"), error_detail, tool_summary,
     )
     row = [
         datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -134,6 +140,7 @@ def log_usage_event(event_type: str, origin: str, destination: str, preferences:
         places_api_stats.get('cache_fresh', 0),
         places_api_stats.get('cache_verified', 0),
         places_api_stats.get('cache_verify_failed', 0),
+        error_detail,
     ]
     try:
         file_exists = os.path.exists(USAGE_LOG_PATH)
@@ -3232,7 +3239,8 @@ if st.session_state.get('planning_triggered', False):
             st.session_state._progress_status = None
             log_usage_event("plan", st.session_state.origin, st.session_state.destination,
                              st.session_state.preferences, duration_s, st.session_state._tool_trace,
-                             {"structured_ok": False, "response_type": "error"},
+                             {"structured_ok": False, "response_type": "error",
+                              "error_detail": f"{type(exc).__name__}: {str(exc)[:300]}"},
                              st.session_state._places_api_stats, st.session_state._routes_api_stats)
             logger.exception("chat.send_message failed while planning")
             st.error(
@@ -3291,7 +3299,8 @@ if st.session_state.get('planning_triggered', False):
             st.session_state._progress_status = None
             log_usage_event("followup", st.session_state.origin, st.session_state.destination,
                              followup, duration_s, st.session_state._tool_trace,
-                             {"structured_ok": False, "response_type": "error"},
+                             {"structured_ok": False, "response_type": "error",
+                              "error_detail": f"{type(exc).__name__}: {str(exc)[:300]}"},
                              st.session_state._places_api_stats, st.session_state._routes_api_stats)
             logger.exception("chat.send_message failed on a follow-up")
             st.error(
