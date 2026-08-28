@@ -8,6 +8,7 @@ from dateutil import parser
 from timezonefinder import TimezoneFinder
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 import base64
 import csv
 import functools
@@ -16,7 +17,9 @@ import logging
 import math
 import os
 import re
+import threading
 import time
+import uuid
 import dotenv
 
 dotenv.load_dotenv()
@@ -379,6 +382,279 @@ def get_wikipedia_thumbnail(place_name: str) -> dict | None:
     except Exception:
         return None
 
+# --- Background plan jobs (survive the requesting browser tab disconnecting) ---
+#
+# Streamlit deliberately stops a session's own script execution when its WebSocket disconnects
+# (a documented, intentional behavior in the Streamlit codebase itself, not a bug) -- confirmed
+# directly against this app's real failure: a user navigated away mid-plan, and by the time they
+# came back the request had vanished with no trace, not even a usage-log row, because the whole
+# script (including the code that would have logged it) had been torn down along with the socket.
+# Plans here routinely take 40 seconds to several minutes -- long enough that navigating away
+# during the wait is completely normal user behavior, not an edge case.
+#
+# The fix: the actual chat.send_message() call and everything downstream of it now runs on a
+# process-wide (not per-session) ThreadPoolExecutor, obtained via @st.cache_resource with its
+# default *global* scope -- global-scoped cache_resource objects are shared across every session
+# and are NOT torn down when one session disconnects (only session-scoped resources are); only a
+# ThreadPoolExecutor, not a ProcessPoolExecutor, is supported inside Streamlit. A disconnect now
+# only interrupts the lightweight polling loop that checks "is my job done yet", never the actual
+# work, which keeps running regardless of whether anyone is still connected to watch it. The job's
+# id is stashed in the URL (st.query_params), so any browser tab that loads with that id -- the
+# same one reconnecting, a different tab, even after the whole page was closed and reopened --
+# finds the same job and either sees live progress or the finished result.
+#
+# A background worker thread has no ScriptRunContext, so it cannot touch st.session_state at all
+# (the same hard rule already established for the ThreadPoolExecutor fan-outs inside the tool
+# functions themselves, just now applying to the *outer* call too). Everything a plan needs to
+# read or write while running -- the API key, the route polyline, discovered places, live progress
+# lines -- goes through the PlanJob object below instead, reached from inside a tool function via
+# a thread-local (so the tool functions' own signatures don't change -- the genai SDK introspects
+# those signatures directly to build Gemini's function-calling schema, so adding a "job" parameter
+# to them would break that). Once a job finishes, its data is copied into st.session_state exactly
+# once by the (main-thread, session-state-safe) polling code below, and every existing render
+# function keeps working completely unmodified from that point on.
+
+
+@dataclass
+class PlanJob:
+    """Everything one plan (or follow-up) request needs while running in the background, and the
+    result once it's done. Deliberately mirrors the shape of what used to live directly in
+    st.session_state -- this is that same data, just addressed through a job object a background
+    thread can safely touch instead of through session state, which it can't."""
+    status: str = "running"  # "running" | "done" | "error"
+    event_type: str = "plan"  # "plan" | "followup" -- for usage-log event_type
+    origin: str = ""
+    destination: str = ""
+    preferences: str = ""
+    user_message: str = ""  # the human-visible chat bubble, e.g. a follow-up question; blank for
+                             # an initial plan, which never showed one even before background jobs
+    started_at: float = field(default_factory=time.monotonic)
+    progress: list = field(default_factory=list)
+    tool_trace: list = field(default_factory=list)
+    places_api_stats: dict = field(default_factory=dict)
+    routes_api_stats: dict = field(default_factory=dict)
+    route_polyline: str | None = None
+    route_waypoints: list = field(default_factory=list)
+    discovered_places: dict = field(default_factory=dict)
+    chat: object = None  # the genai chat session -- kept so a follow-up can continue it
+    content: str | None = None
+    response_meta: dict = field(default_factory=dict)
+    # response_to_markdown's side effect of stashing a parsed plan for render_plan_cards used to
+    # write st.session_state.latest_plan directly -- unsafe now that it can run on a worker thread
+    # with no ScriptRunContext, so it lands here instead and the merge step below copies it over.
+    latest_plan: dict | None = None
+
+
+# Thread-local, not a plain global -- multiple plan jobs can genuinely run concurrently (different
+# users, or a user firing off a follow-up while another tab of theirs is still polling an earlier
+# one), and each worker thread must only ever see its own job.
+_job_local = threading.local()
+
+
+def _current_job() -> "PlanJob | None":
+    return getattr(_job_local, "job", None)
+
+
+@st.cache_resource(show_spinner=False)
+def _get_job_executor() -> ThreadPoolExecutor:
+    """Process-wide thread pool for running plan jobs -- see the module comment above for why this
+    specifically needs to be a global-scoped (the @st.cache_resource default) resource, not
+    something created per-session."""
+    return ThreadPoolExecutor(max_workers=4, thread_name_prefix="plan_job")
+
+
+@st.cache_resource(show_spinner=False)
+def _get_job_registry() -> dict:
+    """Process-wide {'lock': threading.Lock(), 'jobs': {job_id: PlanJob}}. The lock guards against
+    the rare but real race of a worker thread finishing a job at the same moment a browser tab's
+    polling code reads it."""
+    return {"lock": threading.Lock(), "jobs": {}}
+
+
+def _maps_api_key() -> str:
+    """Server-side key, identical for every user/session -- reading it directly from the
+    environment (instead of st.session_state, which tool functions can no longer safely touch once
+    they're running inside a background job thread) sidesteps the whole session-state-thread-safety
+    question for something that was never actually per-session data in the first place."""
+    return os.environ.get("GOOGLE_MAPS_API_KEY", "")
+
+def _api_stats(job_attr: str, session_key: str) -> dict:
+    """The mutable {'new': n, 'legacy': n, 'failed': n} tally for the current job when running in a
+    background job thread (can't touch st.session_state there), else the same tally on
+    st.session_state directly -- same dual-path fallback as everywhere else in this block."""
+    job = _current_job()
+    if job is not None:
+        stats = getattr(job, job_attr)
+        if not stats:
+            stats.update({'new': 0, 'legacy': 0, 'failed': 0})
+        return stats
+    return st.session_state.setdefault(session_key, {'new': 0, 'legacy': 0, 'failed': 0})
+
+def _route_polyline() -> str | None:
+    """Reads the encoded route polyline calculate_route_and_etas stashed earlier this same request
+    -- from the current job when running in a background job thread (both calculate_route_and_etas
+    and search_places_along_route run as the same job, just possibly different calls into it), else
+    st.session_state directly."""
+    job = _current_job()
+    if job is not None:
+        return job.route_polyline
+    return st.session_state.get('route_polyline')
+
+def _route_waypoints() -> list:
+    """Same dual-path fallback as _route_polyline, for the traffic-timed waypoints."""
+    job = _current_job()
+    if job is not None:
+        return job.route_waypoints
+    return st.session_state.get('route_waypoints') or []
+
+def _discovered_places() -> dict:
+    """The mutable discovered-places dict for the current job when running in a background job
+    thread, else st.session_state's copy -- same dual-path fallback pattern."""
+    job = _current_job()
+    if job is not None:
+        return job.discovered_places
+    if 'discovered_places' not in st.session_state:
+        st.session_state.discovered_places = {}
+    return st.session_state.discovered_places
+
+
+@st.cache_resource(show_spinner=False)
+def _get_plan_results_worksheet():
+    """Durable backstop for a finished job's result, in case the whole server process restarts
+    (a redeploy, a crash) between when a job finishes and when its browser tab reconnects --
+    @st.cache_resource's in-memory job registry above doesn't survive that, only a real restart of
+    a single session does. Returns None (the in-memory registry becomes the only source of truth,
+    same as before this existed) when Sheets credentials aren't configured or the Sheet can't be
+    reached."""
+    creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS_JSON")
+    sheet_id = os.environ.get("USAGE_SHEET_ID")
+    if not creds_json or not sheet_id:
+        return None
+    try:
+        import gspread
+        gc = gspread.service_account_from_dict(json.loads(creds_json))
+        spreadsheet = gc.open_by_key(sheet_id)
+        try:
+            sheet = spreadsheet.worksheet("plan_results")
+        except gspread.exceptions.WorksheetNotFound:
+            sheet = spreadsheet.add_worksheet(title="plan_results", rows=2000, cols=8)
+            sheet.append_row(["job_id", "timestamp_utc", "version", "origin", "destination",
+                               "status", "content", "response_meta_json", "extra_json"])
+        return sheet
+    except Exception:
+        logger.exception("failed to connect to the plan_results worksheet")
+        return None
+
+
+def _persist_job_result(job_id: str, job: "PlanJob"):
+    """Best-effort durable copy of a finished job -- never allowed to raise into the worker thread
+    that calls it, since a failure here should never be confused with the plan itself failing."""
+    sheet = _get_plan_results_worksheet()
+    if sheet is None:
+        return
+    try:
+        sheet.append_row([
+            job_id,
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            APP_VERSION,
+            job.origin,
+            job.destination,
+            job.status,
+            job.content or "",
+            json.dumps(job.response_meta or {}, ensure_ascii=False),
+            json.dumps(
+                {
+                    "route_polyline": job.route_polyline,
+                    "discovered_places": job.discovered_places,
+                    "latest_plan": job.latest_plan,
+                    "user_message": job.user_message,
+                },
+                ensure_ascii=False,
+            ),
+        ])
+    except Exception:
+        logger.exception(f"failed to persist plan_results row for job {job_id}")
+
+
+def _load_job_result_from_sheet(job_id: str) -> "PlanJob | None":
+    """Reconstructs a minimal, read-only PlanJob from the durable backstop -- used only when a job
+    id from the URL isn't in the in-memory registry (the server process restarted since it
+    finished). No 'chat' object survives this path, since a genai chat session isn't serializable
+    -- a restored plan can be viewed, but a follow-up on it starts a fresh conversation rather than
+    continuing the old one. Returns None if the Sheet isn't configured, unreachable, or has no
+    matching row."""
+    sheet = _get_plan_results_worksheet()
+    if sheet is None:
+        return None
+    try:
+        rows = sheet.get_all_records()
+    except Exception:
+        logger.exception("failed to read the plan_results worksheet")
+        return None
+    for row in reversed(rows):
+        if str(row.get("job_id")) != job_id:
+            continue
+        try:
+            extra = json.loads(row.get("extra_json") or "{}")
+            response_meta = json.loads(row.get("response_meta_json") or "{}")
+        except json.JSONDecodeError:
+            extra, response_meta = {}, {}
+        job = PlanJob(
+            status=row.get("status") or "done",
+            origin=row.get("origin", ""),
+            destination=row.get("destination", ""),
+            content=row.get("content") or None,
+            response_meta=response_meta,
+            route_polyline=extra.get("route_polyline"),
+            discovered_places=extra.get("discovered_places") or {},
+            latest_plan=extra.get("latest_plan"),
+            user_message=extra.get("user_message") or "",
+        )
+        return job
+    return None
+
+
+def _run_plan_job(job_id: str, prompt: str, existing_chat):
+    """Runs entirely on a background worker thread (submitted via _get_job_executor) -- independent
+    of whatever browser session requested it, per the module comment above. existing_chat is always
+    the caller's already-created genai chat session (created eagerly, main-thread-only, before any
+    job is ever submitted -- see the "Reuse the same chat session" comment in the UI code below), so
+    a plan's first request and every follow-up after it share one real conversation."""
+    registry = _get_job_registry()
+    with registry["lock"]:
+        job = registry["jobs"][job_id]
+    _job_local.job = job
+    try:
+        # Stashed on the job, not just left as the caller's own reference -- a reconnect wipes
+        # st.session_state entirely, so this copy is the only way a later poll can keep the same
+        # conversation going rather than losing it.
+        job.chat = existing_chat
+        response = existing_chat.send_message(prompt)
+        content, response_meta = response_to_markdown(response.text)
+        with registry["lock"]:
+            job.content = content
+            job.response_meta = response_meta
+            job.status = "done"
+    except Exception as exc:
+        # Deliberately broad -- see the matching comment that used to sit at the old inline call
+        # site (git history / PROCESS.md) for why: this is the single outermost boundary of the
+        # whole planning request, so anything that reaches here should degrade to a clear error
+        # state rather than silently killing the worker thread with nothing recorded anywhere.
+        with registry["lock"]:
+            job.response_meta = {
+                "structured_ok": False, "response_type": "error",
+                "error_detail": f"{type(exc).__name__}: {str(exc)[:300]}",
+            }
+            job.status = "error"
+        logger.exception(f"plan job {job_id} failed")
+    finally:
+        duration_s = time.monotonic() - job.started_at
+        log_usage_event(job.event_type, job.origin, job.destination, job.preferences, duration_s,
+                         job.tool_trace, job.response_meta or {}, job.places_api_stats, job.routes_api_stats)
+        _persist_job_result(job_id, job)
+        _job_local.job = None
+
+
 # --- Gemini Tool Definitions ---
 
 _TOOL_LABELS = {
@@ -417,9 +693,18 @@ def timed_tool(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         detail = _tool_call_detail(func.__name__, kwargs)
-        status = st.session_state.get("_progress_status")
-        if status is not None:
-            status.write(f"{_TOOL_LABELS.get(func.__name__, func.__name__)}{detail}...")
+        line = f"{_TOOL_LABELS.get(func.__name__, func.__name__)}{detail}..."
+        # Tool functions now always run inside a background job's worker thread (see the module
+        # comment above PlanJob), which has no ScriptRunContext and so cannot touch
+        # st.session_state -- _current_job() is the thread-local reached from there. The
+        # session_state branch is kept as a harmless fallback, not the expected path anymore.
+        job = _current_job()
+        if job is not None:
+            job.progress.append(line)
+        else:
+            status = st.session_state.get("_progress_status")
+            if status is not None:
+                status.write(line)
 
         start = time.monotonic()
         try:
@@ -431,9 +716,13 @@ def timed_tool(func):
             raise
         finally:
             duration_s = time.monotonic() - start
-            trace = st.session_state.get("_tool_trace")
-            if trace is not None:
-                trace.append({"name": func.__name__, "detail": detail, "duration_s": duration_s, "ok": ok})
+            entry = {"name": func.__name__, "detail": detail, "duration_s": duration_s, "ok": ok}
+            if job is not None:
+                job.tool_trace.append(entry)
+            else:
+                trace = st.session_state.get("_tool_trace")
+                if trace is not None:
+                    trace.append(entry)
             logger.info("tool=%s%s duration_s=%.2f ok=%s", func.__name__, detail, duration_s, ok)
     return wrapper
 
@@ -762,7 +1051,7 @@ def _toll_from_live_lookup(origin: str, destination: str, encoded_polyline: str,
         if not candidates:
             return None
 
-        api_key = st.session_state.get("google_maps_api_key")
+        api_key = _maps_api_key()
         if not api_key:
             return None
         geocode_headers = {
@@ -847,7 +1136,7 @@ def calculate_route_and_etas(origin: str, destination: str, departure_time_iso: 
     lunch spot" and "you'll actually get there at 2:30pm." May be null/empty if this enrichment call
     failed; the rest of the response is unaffected either way.
     """
-    api_key = st.session_state.get("google_maps_api_key")
+    api_key = _maps_api_key()
     if not api_key:
         return {"error": "GOOGLE_MAPS_API_KEY is not configured on the server."}
 
@@ -939,10 +1228,10 @@ def calculate_route_and_etas(origin: str, destination: str, departure_time_iso: 
         routes_data, legacy_error = _route_legacy()
         source = "legacy"
         if legacy_error:
-            stats = st.session_state.setdefault('_routes_api_stats', {'new': 0, 'legacy': 0, 'failed': 0})
+            stats = _api_stats('routes_api_stats', '_routes_api_stats')
             stats['failed'] = stats.get('failed', 0) + 1
             return {"error": f"Both Routes APIs failed -- new: {error}; legacy: {legacy_error}"}
-    stats = st.session_state.setdefault('_routes_api_stats', {'new': 0, 'legacy': 0, 'failed': 0})
+    stats = _api_stats('routes_api_stats', '_routes_api_stats')
     stats[source] = stats.get(source, 0) + 1
 
     if not routes_data.get('routes'):
@@ -996,8 +1285,14 @@ def calculate_route_and_etas(origin: str, destination: str, departure_time_iso: 
 
     # Stashed for the UI (route map) and for search_places_along_route to read directly, rather
     # than sent to the model as a return value -- see search_places_along_route's docstring for why
-    # (the model corrupting this ~8-9KB opaque string when passing it back as an argument).
-    st.session_state.route_polyline = route['polyline']['encodedPolyline']
+    # (the model corrupting this ~8-9KB opaque string when passing it back as an argument). Goes on
+    # the current PlanJob, not st.session_state -- this runs on a background job's worker thread,
+    # which has no ScriptRunContext (see the module comment above PlanJob).
+    job = _current_job()
+    if job is not None:
+        job.route_polyline = route['polyline']['encodedPolyline']
+    else:
+        st.session_state.route_polyline = route['polyline']['encodedPolyline']
 
     # A second, real Routes API call for real traffic-aware timing at a few points along the route
     # -- not just the trip's start/end. Two calls, not the model's own guesswork: without this, the
@@ -1068,7 +1363,10 @@ def calculate_route_and_etas(origin: str, destination: str, departure_time_iso: 
     # Best-effort: if this failed or found nothing, search_places_along_route falls back to its own
     # distance-only guess (see its _fallback_break_points) rather than the whole plan failing over a
     # secondary enrichment call.
-    st.session_state.route_waypoints = waypoints
+    if job is not None:
+        job.route_waypoints = waypoints
+    else:
+        st.session_state.route_waypoints = waypoints
 
     return {
         "total_duration_seconds": total_duration_seconds,
@@ -1149,7 +1447,7 @@ def search_places_along_route(categories: list[str]) -> dict:
     it to state or imply restroom availability, hours, or anything else that get_place_details_and_
     reviews's real per-place fields already cover -- those facts, when available, always win.
     """
-    encoded_polyline = st.session_state.get('route_polyline')
+    encoded_polyline = _route_polyline()
     if not encoded_polyline:
         return {"error": "No route has been calculated yet -- call calculate_route_and_etas first."}
 
@@ -1159,7 +1457,7 @@ def search_places_along_route(categories: list[str]) -> dict:
     route_cum = route_cumulative_km(route_path)
     route_total_km = route_cum[-1] if route_cum else 0.0
 
-    api_key = st.session_state.get("google_maps_api_key")
+    api_key = _maps_api_key()
     if not api_key:
         return {"error": "GOOGLE_MAPS_API_KEY is not configured on the server."}
 
@@ -1193,7 +1491,7 @@ def search_places_along_route(categories: list[str]) -> dict:
     # validated against real traffic, this fallback wasn't. Always add the start and end as anchors
     # too (a genuine "eat before you leave" / "near arrival" option is legitimate), since those
     # waypoints only cover the intermediate points, not the trip's own start/end.
-    stored_waypoints = st.session_state.get('route_waypoints') or []
+    stored_waypoints = _route_waypoints()
     if stored_waypoints and route_path:
         break_points = [(route_path[0][0], route_path[0][1], 0.0)]
         break_points += [(w['lat'], w['lng'], w['km_from_origin']) for w in stored_waypoints]
@@ -1285,13 +1583,12 @@ def search_places_along_route(categories: list[str]) -> dict:
     with ThreadPoolExecutor(max_workers=min(8, len(work_items)) or 1) as executor:
         fetched = list(executor.map(lambda w: _fetch_at_point(*w), work_items))
 
-    if 'discovered_places' not in st.session_state:
-        st.session_state.discovered_places = {}
+    discovered_places = _discovered_places()
 
     # Tracks which tier (new/legacy/failed) actually served each category's results this request --
     # read by log_usage_event so "how often is the fallback needed, how often do both fail" is a
     # real, trackable number instead of something only visible by reading server logs (see HANDOFF.md).
-    api_stats = st.session_state.setdefault('_places_api_stats', {'new': 0, 'legacy': 0, 'failed': 0})
+    api_stats = _api_stats('places_api_stats', '_places_api_stats')
 
     by_category: dict[str, list[tuple[float, list[dict] | None, str | None, str]]] = {c: [] for c in categories}
     for category, km, places_data, error, source in fetched:
@@ -1345,7 +1642,7 @@ def search_places_along_route(categories: list[str]) -> dict:
             # for it later -- the chat response is free-form text, so this is the only reliable
             # source of real place_ids and coordinates. Lat/lng isn't sent to the model, just
             # stashed for the UI.
-            st.session_state.discovered_places[p_data['id']] = {
+            discovered_places[p_data['id']] = {
                 "name": p_data['displayName']['text'],
                 "vicinity": p_data.get('formattedAddress', ''),
                 "lat": lat, "lng": lng,
@@ -1392,7 +1689,7 @@ def get_place_details_and_reviews(place_ids: list[str]) -> dict:
     doesn't have one. Matters most for hospital/emergency options, where a name and a rating alone
     aren't actually useful in an emergency.
     """
-    api_key = st.session_state.get("google_maps_api_key")
+    api_key = _maps_api_key()
     if not api_key:
         return {"error": "GOOGLE_MAPS_API_KEY is not configured on the server."}
 
@@ -1566,7 +1863,7 @@ def get_place_details_and_reviews(place_ids: list[str]) -> dict:
 
     # See the matching comment in search_places_along_route -- same tracked-tier pattern, same key,
     # so one request's stats cover both tools' underlying Places calls together.
-    api_stats = st.session_state.setdefault('_places_api_stats', {'new': 0, 'legacy': 0, 'failed': 0})
+    api_stats = _api_stats('places_api_stats', '_places_api_stats')
     now = datetime.now(timezone.utc)
     cache = _load_place_details_cache()
 
@@ -1576,8 +1873,9 @@ def get_place_details_and_reviews(place_ids: list[str]) -> dict:
         stashes its photo for the UI -- shared by every path (cache-fresh, cache-verified, freshly
         fetched) so this bookkeeping can't accidentally be skipped for a cache hit."""
         results.append({"place_id": place_id, **model_dict})
-        if photo_name and place_id in st.session_state.get('discovered_places', {}):
-            st.session_state.discovered_places[place_id]['photo_name'] = photo_name
+        discovered_places = _discovered_places()
+        if photo_name and place_id in discovered_places:
+            discovered_places[place_id]['photo_name'] = photo_name
 
     results = []
     cache_writes = []
@@ -2669,7 +2967,8 @@ def response_to_markdown(response_text: str) -> tuple[str, dict]:
     that knows whether structured output actually worked on this turn, so it's the natural place to
     capture that as a performance signal instead of re-deriving it at the call site.
 
-    As a side effect, stashes data['plan'] into st.session_state.latest_plan whenever this turn is a
+    As a side effect, stashes data['plan'] into the current PlanJob (or st.session_state.latest_plan
+    directly if there isn't one -- see the module comment above PlanJob) whenever this turn is a
     successfully-parsed 'plan' response -- that's what lets render_plan_cards, the stop-selector, and
     the share/print controls act on the plan the user is actually looking at, not just its rendered
     Markdown text. A conversational 'answer' turn leaves the previous plan in place deliberately: the
@@ -2681,7 +2980,11 @@ def response_to_markdown(response_text: str) -> tuple[str, dict]:
     try:
         markdown = render_structured_response(data)
         if data.get("response_type") == "plan" and data.get("plan"):
-            st.session_state.latest_plan = data["plan"]
+            job = _current_job()
+            if job is not None:
+                job.latest_plan = data["plan"]
+            else:
+                st.session_state.latest_plan = data["plan"]
         return markdown, {"structured_ok": True, "response_type": data.get("response_type")}
     except Exception:
         logger.exception("structured response rendering failed, showing raw text")
@@ -2948,7 +3251,13 @@ if st.button("Plan My Trip", width='stretch'):
         st.session_state.latest_plan_message_index = None
         st.session_state.need_new_plan = True
 
-if st.session_state.get('planning_triggered', False):
+if st.session_state.get('planning_triggered', False) or st.query_params.get('plan_id'):
+    # The query-param check alongside the session-state flag matters specifically for the
+    # amnesia fix (see the module comment above PlanJob): a browser tab reconnecting after being
+    # away gets a brand-new session with planning_triggered unset, same as a tab that's never
+    # planned anything -- the URL's plan_id is the only thing that survives that and says this
+    # session should still enter this block to poll for/restore its job.
+    st.session_state.planning_triggered = True
     if not st.session_state.get('gemini_api_key'):
         st.error("GEMINI_API_KEY is not configured on the server.")
         st.stop()
@@ -3182,7 +3491,10 @@ if st.session_state.get('planning_triggered', False):
         )
     )
 
-    # Reuse the same chat session across reruns so follow-up questions share context.
+    # Reuse the same chat session across reruns so follow-up questions share context. Also handed
+    # to _run_plan_job as existing_chat below -- created here, eagerly and main-thread-only, so a
+    # plan's first request and every follow-up after it share one real conversation regardless of
+    # which background job thread is actually driving it at any given moment.
     if st.session_state.get('chat') is None:
         st.session_state.chat = client.chats.create(
             model='gemini-3.6-flash',
@@ -3192,6 +3504,84 @@ if st.session_state.get('planning_triggered', False):
 
     if 'chat_messages' not in st.session_state:
         st.session_state.chat_messages = []
+
+    def _submit_job(event_type: str, prompt: str, user_message: str = ""):
+        """Registers a new PlanJob, hands it to the process-wide executor, and points the URL at
+        it -- see the module comment above PlanJob for why this, instead of just calling
+        chat.send_message() directly here on the main thread, is what actually survives the
+        requesting browser tab going away mid-request."""
+        job_id = uuid.uuid4().hex
+        job = PlanJob(
+            event_type=event_type,
+            origin=st.session_state.origin,
+            destination=st.session_state.destination,
+            preferences=st.session_state.preferences,
+            user_message=user_message,
+        )
+        registry = _get_job_registry()
+        with registry["lock"]:
+            registry["jobs"][job_id] = job
+        _get_job_executor().submit(_run_plan_job, job_id, prompt, chat)
+        st.query_params["plan_id"] = job_id
+        if user_message:
+            st.session_state.chat_messages.append({"role": "user", "content": user_message})
+        # Marks this bubble as already shown in THIS session, so the merge step below (which exists
+        # for a browser tab that DIDN'T just submit this job -- a reconnect, or a second tab) knows
+        # not to add a duplicate once the job shows up as done.
+        st.session_state._user_bubble_job_id = job_id
+
+    # --- Poll/restore the job named in the URL, if any (see the module comment above PlanJob) ---
+    # Runs on every script execution, independent of whether a new plan/follow-up is also being
+    # submitted this same run -- a tab that reconnects mid-job, or loads fresh with an old plan_id
+    # still sitting in its URL, needs this to see the running/finished job either way.
+    plan_job_id = st.query_params.get("plan_id")
+    active_job = None
+    if plan_job_id:
+        registry = _get_job_registry()
+        with registry["lock"]:
+            active_job = registry["jobs"].get(plan_job_id)
+        if active_job is None:
+            # Not in the in-memory registry -- either it finished before a server restart, or this
+            # browser session is brand new and never saw that registry to begin with.
+            active_job = _load_job_result_from_sheet(plan_job_id)
+        if active_job is not None:
+            # A session restored purely from the URL (a genuine reconnect, or a server restart)
+            # never ran the "Plan My Trip" button handler that normally sets these -- needed here,
+            # not just for display, since a follow-up's own _submit_job call reads them directly.
+            st.session_state.setdefault("origin", active_job.origin)
+            st.session_state.setdefault("destination", active_job.destination)
+            st.session_state.setdefault("preferences", active_job.preferences)
+
+    if active_job is not None and active_job.status != "running":
+        if active_job.user_message and st.session_state.get("_user_bubble_job_id") != plan_job_id:
+            st.session_state.chat_messages.append({"role": "user", "content": active_job.user_message})
+            st.session_state._user_bubble_job_id = plan_job_id
+        if st.session_state.get("_merged_job_id") != plan_job_id:
+            # Copy the finished (or errored) job's result into st.session_state exactly once --
+            # every render function below reads st.session_state and needs no changes past this.
+            if active_job.status == "done":
+                if active_job.chat is not None:
+                    st.session_state.chat = active_job.chat
+                    chat = active_job.chat
+                if active_job.route_polyline is not None:
+                    st.session_state.route_polyline = active_job.route_polyline
+                if active_job.route_waypoints:
+                    st.session_state.route_waypoints = active_job.route_waypoints
+                if active_job.discovered_places:
+                    st.session_state.discovered_places = active_job.discovered_places
+                if active_job.latest_plan is not None:
+                    st.session_state.latest_plan = active_job.latest_plan
+                st.session_state.chat_messages.append({"role": "assistant", "content": active_job.content})
+                if active_job.response_meta.get("structured_ok") and active_job.response_meta.get("response_type") == "plan":
+                    st.session_state.latest_plan_message_index = len(st.session_state.chat_messages) - 1
+            else:  # "error" -- matches the wording the old inline error handling used
+                st.error(
+                    "That request hit a temporary error talking to Gemini. This usually clears up "
+                    "on its own -- please try again in a moment."
+                )
+            st.session_state._merged_job_id = plan_job_id
+
+    job_running = plan_job_id is not None and active_job is not None and active_job.status == "running"
 
     if st.session_state.get('need_new_plan', False):
         st.session_state.need_new_plan = False
@@ -3205,58 +3595,17 @@ if st.session_state.get('planning_triggered', False):
             "unless my notes actually ask for one. Finally, fetch place details/reviews for the best options and "
             "evaluate them appropriately for what I asked for."
         )
-        status = st.status("Planning your trip and evaluating live stops...", expanded=True)
-        st.session_state._progress_status = status
-        st.session_state._tool_trace = []
-        st.session_state._places_api_stats = {}
-        st.session_state._routes_api_stats = {}
-        start = time.monotonic()
-        try:
-            # response.text (not just chat.send_message itself) is deliberately inside this try:
-            # the genai SDK raises ValueError from .text when a response has no valid text part --
-            # e.g. a safety-blocked turn, or the AFC loop exhausting maximum_remote_calls mid-plan
-            # and leaving an unresolved function_call with no text turn (see the comment on
-            # maximum_remote_calls above). A tool function raising (e.g. a malformed Maps API
-            # response triggering a KeyError inside calculate_route_and_etas) also surfaces here,
-            # since AFC calls tool functions synchronously as part of this one blocking call.
-            response = chat.send_message(prompt)
-            content, response_meta = response_to_markdown(response.text)
-        except Exception as exc:
-            # Deliberately broad, unlike the narrow, specific exception handling used elsewhere in
-            # this file (e.g. _api_request's 5xx-only retry) -- this is the single outermost
-            # boundary of the whole planning request, so anything that reaches here, regardless of
-            # its real cause (Gemini API error, a tool function bug, a malformed API response one of
-            # the tools didn't guard against), should degrade to a clear retry message rather than
-            # crash the whole Streamlit script. Observed directly in production: an uncaught
-            # google.genai.errors.ServerError here did exactly that, showing the user a raw
-            # traceback page -- exactly the kind of ungraceful failure this app is supposed to avoid
-            # (see ARCHITECTURE.md's "no fallback to the model's own knowledge" row for the same
-            # philosophy at a different failure point). The genai SDK already retries transient
-            # failures internally (tenacity) before raising, so retrying immediately here wouldn't
-            # help -- degrade instead.
-            duration_s = time.monotonic() - start
-            status.update(label="⚠️ Planning hit an error", state="error")
-            st.session_state._progress_status = None
-            log_usage_event("plan", st.session_state.origin, st.session_state.destination,
-                             st.session_state.preferences, duration_s, st.session_state._tool_trace,
-                             {"structured_ok": False, "response_type": "error",
-                              "error_detail": f"{type(exc).__name__}: {str(exc)[:300]}"},
-                             st.session_state._places_api_stats, st.session_state._routes_api_stats)
-            logger.exception("chat.send_message failed while planning")
-            st.error(
-                "The trip planner hit a temporary error talking to Gemini. This usually clears up "
-                "on its own -- please click 'Plan My Trip' again in a moment."
-            )
-        else:
-            duration_s = time.monotonic() - start
-            status.update(label=f"✅ Plan ready in {duration_s:.1f}s", state="complete")
-            log_usage_event("plan", st.session_state.origin, st.session_state.destination,
-                             st.session_state.preferences, duration_s, st.session_state._tool_trace, response_meta,
-                             st.session_state._places_api_stats, st.session_state._routes_api_stats)
-            st.session_state._progress_status = None
-            st.session_state.chat_messages.append({"role": "assistant", "content": content})
-            if response_meta.get("structured_ok") and response_meta.get("response_type") == "plan":
-                st.session_state.latest_plan_message_index = len(st.session_state.chat_messages) - 1
+        _submit_job("plan", prompt)
+        st.rerun()
+
+    if job_running:
+        label = "Planning your trip and evaluating live stops..." if active_job.event_type == "plan" else "Thinking..."
+        # A background job thread has no Streamlit widget to write live progress into (see the
+        # module comment above PlanJob) -- this just renders its latest snapshot fresh each poll,
+        # rather than growing a persistent status log the way the old inline version could.
+        with st.status(label, expanded=True) as status:
+            for line in active_job.progress[-8:]:
+                status.write(line)
 
     st.subheader("Your Personalized Journey Plan")
     for i, message in enumerate(st.session_state.chat_messages):
@@ -3277,47 +3626,27 @@ if st.session_state.get('planning_triggered', False):
     render_navigate_links()
     render_region_postcards()
 
-    followup = st.chat_input("Ask a follow-up — e.g. 'suggest a different restaurant' or 'what about the return trip?'")
-    if followup:
-        st.session_state.chat_messages.append({"role": "user", "content": followup})
-        status = st.status("Thinking...", expanded=True)
-        st.session_state._progress_status = status
-        st.session_state._tool_trace = []
-        st.session_state._places_api_stats = {}
-        st.session_state._routes_api_stats = {}
-        start = time.monotonic()
-        try:
-            # See the matching comment on the initial-plan call above: response.text and the tool
-            # functions AFC calls along the way can all raise here, not just chat.send_message
-            # itself, so both the call and the .text access belong inside this same try.
-            response = chat.send_message(followup)
-            content, response_meta = response_to_markdown(response.text)
-        except Exception as exc:
-            # Deliberately broad -- see the matching comment on the initial-plan call above.
-            duration_s = time.monotonic() - start
-            status.update(label="⚠️ That follow-up hit an error", state="error")
-            st.session_state._progress_status = None
-            log_usage_event("followup", st.session_state.origin, st.session_state.destination,
-                             followup, duration_s, st.session_state._tool_trace,
-                             {"structured_ok": False, "response_type": "error",
-                              "error_detail": f"{type(exc).__name__}: {str(exc)[:300]}"},
-                             st.session_state._places_api_stats, st.session_state._routes_api_stats)
-            logger.exception("chat.send_message failed on a follow-up")
-            st.error(
-                "That follow-up hit a temporary error talking to Gemini. This usually clears up on "
-                "its own -- please try asking again in a moment."
-            )
-        else:
-            duration_s = time.monotonic() - start
-            status.update(label=f"✅ Answered in {duration_s:.1f}s", state="complete")
-            log_usage_event("followup", st.session_state.origin, st.session_state.destination,
-                             followup, duration_s, st.session_state._tool_trace, response_meta,
-                             st.session_state._places_api_stats, st.session_state._routes_api_stats)
-            st.session_state._progress_status = None
-            st.session_state.chat_messages.append({"role": "assistant", "content": content})
-            if response_meta.get("structured_ok") and response_meta.get("response_type") == "plan":
-                st.session_state.latest_plan_message_index = len(st.session_state.chat_messages) - 1
+    if job_running:
+        # Blocked, not just discouraged -- a second concurrent job would race the first one over
+        # the same plan_id in the URL, and chat.send_message() itself isn't safe to call from two
+        # threads on the same chat session at once.
+        st.caption(
+            "Still working on that -- feel free to switch tabs or come back later, this will be "
+            "here when you do. (Follow-up questions unlock once it's done.)"
+        )
+    else:
+        followup = st.chat_input("Ask a follow-up — e.g. 'suggest a different restaurant' or 'what about the return trip?'")
+        if followup:
+            _submit_job("followup", followup, user_message=followup)
             st.rerun()
+
+    if job_running:
+        # Lightweight polling, not the actual work -- see the module comment above PlanJob. If this
+        # tab disconnects right now, only this sleep-and-rerun loop dies; _run_plan_job keeps going
+        # on the process-wide executor regardless, and any tab that reloads this same URL (this one
+        # reconnecting, or a different one entirely) picks the job back up exactly where it left off.
+        time.sleep(2)
+        st.rerun()
 
 # Always at the very end of the page, regardless of whether a trip has been planned yet -- someone
 # might want to say "the search box is confusing" without ever getting as far as a plan.
